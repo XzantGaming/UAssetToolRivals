@@ -94,8 +94,17 @@ namespace UAssetAPI
                     return sizeof(int);
                 default:
                     string nullTerminatedStr = value.Value + "\0";
-                    this.Write(value.Encoding is UnicodeEncoding ? -nullTerminatedStr.Length : nullTerminatedStr.Length);
                     byte[] actualStrData = value.Encoding.GetBytes(nullTerminatedStr);
+                    // For Unicode (UTF-16), write negative length (character count)
+                    // For ASCII/UTF-8, write positive length (byte count)
+                    if (value.Encoding is UnicodeEncoding)
+                    {
+                        this.Write(-nullTerminatedStr.Length);
+                    }
+                    else
+                    {
+                        this.Write(actualStrData.Length);
+                    }
                     this.Write(actualStrData);
                     return actualStrData.Length + 4;
             }
