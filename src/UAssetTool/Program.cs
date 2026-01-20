@@ -23,6 +23,10 @@ public class Program
 {
     public static async Task<int> Main(string[] args)
     {
+        // Set UTF-8 encoding for console to properly handle Unicode characters (Chinese, Korean, etc.)
+        Console.InputEncoding = System.Text.Encoding.UTF8;
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+        
         // CLI mode: command-line arguments
         if (args.Length > 0)
         {
@@ -60,6 +64,7 @@ public class Program
                 "extract_script_objects" => CliExtractScriptObjects(args),
                 "recompress_iostore" => CliRecompressIoStore(args),
                 "cityhash" => CliCityHash(args),
+                "from_json" => CliFromJson(args),
                 "help" or "--help" or "-h" => CliHelp(),
                 _ => throw new Exception($"Unknown command: {command}")
             };
@@ -96,6 +101,7 @@ public class Program
         Console.WriteLine("  is_iostore_compressed <utoc_path>              - Check if IoStore is compressed");
         Console.WriteLine("  extract_script_objects <paks_path> <output>    - Extract ScriptObjects.bin from game");
         Console.WriteLine("  recompress_iostore <utoc_path>                 - Recompress IoStore with Oodle");
+        Console.WriteLine("  from_json <json_path> <output_uasset> [usmap]  - Convert JSON back to uasset");
         Console.WriteLine();
         Console.WriteLine("Zen Conversion Pipeline (2 steps for debugging):");
         Console.WriteLine("  Step 1: to_zen    - Legacy .uasset/.uexp -> .uzenasset");
@@ -1432,6 +1438,53 @@ public class Program
         return 0;
     }
     
+    private static int CliFromJson(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool from_json <json_path> <output_uasset_path> [usmap_path]");
+            return 1;
+        }
+
+        string jsonPath = args[1];
+        string outputPath = args[2];
+        string? usmapPath = args.Length > 3 ? args[3] : null;
+
+        if (!File.Exists(jsonPath))
+        {
+            Console.Error.WriteLine($"JSON file not found: {jsonPath}");
+            return 1;
+        }
+
+        // Read JSON with UTF-8 encoding to preserve Unicode characters
+        string jsonData = File.ReadAllText(jsonPath, System.Text.Encoding.UTF8);
+        
+        // Load mappings if provided
+        Usmap? mappings = null;
+        if (!string.IsNullOrEmpty(usmapPath) && File.Exists(usmapPath))
+            mappings = new Usmap(usmapPath);
+        
+        // Deserialize from JSON
+        var asset = UAsset.DeserializeJson(jsonData);
+        if (asset == null)
+        {
+            Console.Error.WriteLine("Failed to deserialize JSON");
+            return 1;
+        }
+        
+        asset.Mappings = mappings;
+        
+        // Ensure output directory exists
+        string? outputDir = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDir))
+            Directory.CreateDirectory(outputDir);
+        
+        asset.Write(outputPath);
+        
+        Console.WriteLine($"Asset imported from JSON and saved to {outputPath}");
+        return 0;
+    }
+    
     #endregion
 
     #region Interactive JSON Mode
@@ -1440,8 +1493,12 @@ public class Program
     {
         try
         {
+            // Use StreamReader with explicit UTF-8 encoding to properly handle Unicode characters
+            // This is necessary because Console.In may not properly decode UTF-8 from piped input
+            using var reader = new StreamReader(Console.OpenStandardInput(), System.Text.Encoding.UTF8);
+            
             string? line;
-            while ((line = await Console.In.ReadLineAsync()) != null)
+            while ((line = await reader.ReadLineAsync()) != null)
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
