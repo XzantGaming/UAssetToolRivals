@@ -1479,20 +1479,20 @@ public class Program
             return request.Action switch
             {
                 // Single file detection - all use unified DetectAssetType
-                "detect_texture" => DetectSingleAsset(request.FilePath, "texture"),
-                "detect_mesh" => DetectSingleAsset(request.FilePath, "skeletal_mesh"),
-                "detect_skeletal_mesh" => DetectSingleAsset(request.FilePath, "skeletal_mesh"),
-                "detect_static_mesh" => DetectSingleAsset(request.FilePath, "static_mesh"),
-                "detect_blueprint" => DetectSingleAsset(request.FilePath, "blueprint"),
+                "detect_texture" => DetectSingleAsset(request.FilePath, request.UsmapPath, "texture"),
+                "detect_mesh" => DetectSingleAsset(request.FilePath, request.UsmapPath, "skeletal_mesh"),
+                "detect_skeletal_mesh" => DetectSingleAsset(request.FilePath, request.UsmapPath, "skeletal_mesh"),
+                "detect_static_mesh" => DetectSingleAsset(request.FilePath, request.UsmapPath, "static_mesh"),
+                "detect_blueprint" => DetectSingleAsset(request.FilePath, request.UsmapPath, "blueprint"),
                 
                 // Batch detection - all use unified workflow
-                "batch_detect_skeletal_mesh" => BatchDetectAssetType(request.FilePaths, "skeletal_mesh"),
-                "batch_detect_static_mesh" => BatchDetectAssetType(request.FilePaths, "static_mesh"),
-                "batch_detect_texture" => BatchDetectAssetType(request.FilePaths, "texture"),
-                "batch_detect_blueprint" => BatchDetectAssetType(request.FilePaths, "blueprint"),
+                "batch_detect_skeletal_mesh" => BatchDetectAssetType(request.FilePaths, request.UsmapPath, "skeletal_mesh"),
+                "batch_detect_static_mesh" => BatchDetectAssetType(request.FilePaths, request.UsmapPath, "static_mesh"),
+                "batch_detect_texture" => BatchDetectAssetType(request.FilePaths, request.UsmapPath, "texture"),
+                "batch_detect_blueprint" => BatchDetectAssetType(request.FilePaths, request.UsmapPath, "blueprint"),
                 
                 // Texture operations
-                "get_texture_info" => GetTextureInfo(request.FilePath),
+                "get_texture_info" => GetTextureInfo(request.FilePath, request.UsmapPath),
                 "strip_mipmaps_native" => StripMipmapsNative(request.FilePath, request.UsmapPath),
                 "batch_strip_mipmaps_native" => BatchStripMipmapsNative(request.FilePaths, request.UsmapPath),
                 "has_inline_texture_data" => HasInlineTextureData(request.FilePath, request.UsmapPath),
@@ -1500,7 +1500,7 @@ public class Program
                 
                 // Mesh operations
                 "patch_mesh" => PatchMesh(request.FilePath, request.UexpPath),
-                "get_mesh_info" => GetMeshInfo(request.FilePath),
+                "get_mesh_info" => GetMeshInfo(request.FilePath, request.UsmapPath),
                 "fix_serialize_size" => FixSerializeSizeJson(request.FilePath, request.UsmapPath),
                 
                 // Zen conversion operations
@@ -2106,7 +2106,7 @@ public class Program
     /// <summary>
     /// Detect single asset and check if it matches target type
     /// </summary>
-    private static UAssetResponse DetectSingleAsset(string? filePath, string targetType)
+    private static UAssetResponse DetectSingleAsset(string? filePath, string? usmapPath, string targetType)
     {
         if (string.IsNullOrEmpty(filePath))
             return new UAssetResponse { Success = false, Message = "File path required" };
@@ -2115,8 +2115,9 @@ public class Program
 
         try
         {
-            string? usmapPath = Environment.GetEnvironmentVariable("USMAP_PATH");
-            var asset = LoadAsset(filePath, usmapPath);
+            // Use provided usmap_path, fall back to environment variable
+            string? effectiveUsmapPath = usmapPath ?? Environment.GetEnvironmentVariable("USMAP_PATH");
+            var asset = LoadAsset(filePath, effectiveUsmapPath);
             
             // For textures, also check if it needs MipGen fix
             if (targetType == "texture")
@@ -2148,15 +2149,16 @@ public class Program
     /// <summary>
     /// Batch detect - check multiple files for a specific asset type
     /// </summary>
-    private static UAssetResponse BatchDetectAssetType(List<string>? filePaths, string targetType)
+    private static UAssetResponse BatchDetectAssetType(List<string>? filePaths, string? usmapPath, string targetType)
     {
         if (filePaths == null || filePaths.Count == 0)
             return new UAssetResponse { Success = false, Message = "file_paths required" };
 
         try
         {
-            string? usmapPath = Environment.GetEnvironmentVariable("USMAP_PATH");
-            Usmap? mappings = LoadMappings(usmapPath);
+            // Use provided usmap_path, fall back to environment variable
+            string? effectiveUsmapPath = usmapPath ?? Environment.GetEnvironmentVariable("USMAP_PATH");
+            Usmap? mappings = LoadMappings(effectiveUsmapPath);
 
             bool foundMatch = filePaths.AsParallel().Any(filePath =>
             {
@@ -2739,7 +2741,7 @@ public class Program
         }
     }
     
-    private static UAssetResponse GetTextureInfo(string? filePath)
+    private static UAssetResponse GetTextureInfo(string? filePath, string? usmapPath)
     {
         if (string.IsNullOrEmpty(filePath))
             return new UAssetResponse { Success = false, Message = "File path required" };
@@ -2748,64 +2750,113 @@ public class Program
 
         try
         {
-            string? usmapPath = Environment.GetEnvironmentVariable("USMAP_PATH");
-            var asset = LoadAsset(filePath, usmapPath);
+            // Use provided usmap_path, fall back to environment variable
+            string? effectiveUsmapPath = usmapPath ?? Environment.GetEnvironmentVariable("USMAP_PATH");
+            Console.Error.WriteLine($"[UAssetTool] USMAP path: {effectiveUsmapPath ?? "null"}");
+            
+            if (!string.IsNullOrEmpty(effectiveUsmapPath) && File.Exists(effectiveUsmapPath))
+            {
+                Console.Error.WriteLine($"[UAssetTool] USMAP file found");
+            }
+            else
+            {
+                Console.Error.WriteLine($"[UAssetTool] USMAP file not found or path is null");
+            }
+            
+            var asset = LoadAsset(filePath, effectiveUsmapPath);
             asset.UseSeparateBulkDataFiles = true;
+            
+            Console.Error.WriteLine($"[UAssetTool] Mappings loaded: {asset.Mappings != null}");
             
             var info = ExtractTextureInfo(asset);
             return new UAssetResponse { Success = true, Message = "Texture info retrieved", Data = info };
         }
         catch (Exception ex)
         {
+            Console.Error.WriteLine($"[UAssetTool] Error in GetTextureInfo: {ex.Message}");
             return new UAssetResponse { Success = false, Message = $"Error: {ex.Message}" };
         }
     }
     
     private static Dictionary<string, object> ExtractTextureInfo(UAsset asset)
     {
+        // Use snake_case for consistency with other responses
         var info = new Dictionary<string, object>
         {
-            ["IsTexture2D"] = false,
-            ["MipGenSettings"] = "Unknown"
+            ["is_texture"] = false,
+            ["format"] = "Unknown",
+            ["pixel_format"] = "Unknown",
+            ["width"] = 0,
+            ["height"] = 0,
+            ["mip_count"] = 0,
+            ["mip_gen_settings"] = "Unknown",
+            ["compression_settings"] = "Unknown",
+            ["has_inline_data"] = false,
+            ["size_bytes"] = 0L
         };
         
         foreach (var export in asset.Exports)
         {
-            if (GetExportClassName(asset, export) == "Texture2D" && export is NormalExport normalExport)
+            string className = GetExportClassName(asset, export);
+            if (className == "Texture2D" || className == "TextureCube" || className == "VolumeTexture")
             {
-                info["IsTexture2D"] = true;
+                info["is_texture"] = true;
                 
-                var properties = new List<Dictionary<string, string>>();
-                foreach (var prop in normalExport.Data)
+                // Try to get detailed info from TextureExport
+                if (export is TextureExport textureExport && textureExport.PlatformData != null)
                 {
-                    var propInfo = new Dictionary<string, string>
-                    {
-                        ["Name"] = prop.Name?.Value?.Value ?? "Unknown",
-                        ["Type"] = prop.GetType().Name
-                    };
-                    
-                    if (prop is EnumPropertyData enumProp)
-                        propInfo["Value"] = enumProp.Value?.Value?.Value ?? "null";
-                    else if (prop is BytePropertyData byteProp)
-                        propInfo["Value"] = byteProp.Value.ToString();
-                    else if (prop is IntPropertyData intProp)
-                        propInfo["Value"] = intProp.Value.ToString();
-                    else if (prop is BoolPropertyData boolProp)
-                        propInfo["Value"] = boolProp.Value.ToString();
-                    else
-                        propInfo["Value"] = "(complex)";
-                    
-                    properties.Add(propInfo);
-                    
-                    if (prop.Name?.Value?.Value == "MipGenSettings")
-                    {
-                        if (prop is EnumPropertyData ep)
-                            info["MipGenSettings"] = ep.Value?.Value?.Value ?? "Unknown";
-                        else if (prop is BytePropertyData bp)
-                            info["MipGenSettings"] = $"ByteValue_{bp.Value}";
-                    }
+                    var platformData = textureExport.PlatformData;
+                    info["pixel_format"] = platformData.PixelFormat ?? "Unknown";
+                    info["format"] = $"PF_{platformData.PixelFormat ?? "Unknown"}";
+                    info["width"] = platformData.SizeX;
+                    info["height"] = platformData.SizeY;
+                    info["mip_count"] = platformData.Mips?.Count ?? 0;
+                    info["has_inline_data"] = !textureExport.HasExternalBulkData;
+                    info["size_bytes"] = platformData.GetTotalMipDataSize();
                 }
-                info["Properties"] = properties;
+                
+                // Extract properties from NormalExport
+                if (export is NormalExport normalExport && normalExport.Data != null)
+                {
+                    var properties = new List<Dictionary<string, string>>();
+                    foreach (var prop in normalExport.Data)
+                    {
+                        var propInfo = new Dictionary<string, string>
+                        {
+                            ["name"] = prop.Name?.Value?.Value ?? "Unknown",
+                            ["type"] = prop.GetType().Name
+                        };
+                        
+                        if (prop is EnumPropertyData enumProp)
+                            propInfo["value"] = enumProp.Value?.Value?.Value ?? "null";
+                        else if (prop is BytePropertyData byteProp)
+                            propInfo["value"] = byteProp.Value.ToString();
+                        else if (prop is IntPropertyData intProp)
+                            propInfo["value"] = intProp.Value.ToString();
+                        else if (prop is BoolPropertyData boolProp)
+                            propInfo["value"] = boolProp.Value.ToString();
+                        else
+                            propInfo["value"] = "(complex)";
+                        
+                        properties.Add(propInfo);
+                        
+                        // Extract specific texture settings
+                        string propName = prop.Name?.Value?.Value ?? "";
+                        if (propName == "MipGenSettings")
+                        {
+                            if (prop is EnumPropertyData ep)
+                                info["mip_gen_settings"] = ep.Value?.Value?.Value ?? "Unknown";
+                            else if (prop is BytePropertyData bp)
+                                info["mip_gen_settings"] = $"ByteValue_{bp.Value}";
+                        }
+                        else if (propName == "CompressionSettings")
+                        {
+                            if (prop is EnumPropertyData ep)
+                                info["compression_settings"] = ep.Value?.Value?.Value ?? "Unknown";
+                        }
+                    }
+                    info["properties"] = properties;
+                }
                 break;
             }
         }
@@ -2842,7 +2893,7 @@ public class Program
         }
     }
     
-    private static UAssetResponse GetMeshInfo(string? filePath)
+    private static UAssetResponse GetMeshInfo(string? filePath, string? usmapPath)
     {
         if (string.IsNullOrEmpty(filePath))
             return new UAssetResponse { Success = false, Message = "File path required" };
@@ -2851,19 +2902,71 @@ public class Program
 
         try
         {
+            // Use provided usmap_path, fall back to environment variable
+            string? effectiveUsmapPath = usmapPath ?? Environment.GetEnvironmentVariable("USMAP_PATH");
+            Console.Error.WriteLine($"[UAssetTool] GetMeshInfo USMAP path: {effectiveUsmapPath ?? "null"}");
+            
+            var asset = LoadAsset(filePath, effectiveUsmapPath);
+            asset.UseSeparateBulkDataFiles = true;
+            
+            // Use snake_case for consistency with other responses
             var info = new Dictionary<string, object>
             {
-                ["MaterialCount"] = 0,
-                ["VertexCount"] = 0,
-                ["TriangleCount"] = 0,
-                ["IsSkeletalMesh"] = false
+                ["mesh_type"] = "Unknown",
+                ["vertex_count"] = 0,
+                ["triangle_count"] = 0,
+                ["lod_count"] = 0,
+                ["material_slots"] = 0,
+                ["bone_count"] = 0,
+                ["has_morph_targets"] = false,
+                ["has_vertex_colors"] = false
             };
             
-            // TODO: Implement actual mesh info extraction
-            return new UAssetResponse { Success = true, Message = "Mesh info placeholder", Data = info };
+            foreach (var export in asset.Exports)
+            {
+                string className = GetExportClassName(asset, export);
+                
+                if (className == "SkeletalMesh")
+                {
+                    info["mesh_type"] = "SkeletalMesh";
+                    // Extract skeletal mesh properties if available
+                    if (export is NormalExport normalExport && normalExport.Data != null)
+                    {
+                        foreach (var prop in normalExport.Data)
+                        {
+                            string propName = prop.Name?.Value?.Value ?? "";
+                            if (propName == "Materials" && prop is ArrayPropertyData arrayProp)
+                            {
+                                info["material_slots"] = arrayProp.Value?.Length ?? 0;
+                            }
+                        }
+                    }
+                    break;
+                }
+                else if (className == "StaticMesh")
+                {
+                    info["mesh_type"] = "StaticMesh";
+                    // Extract static mesh properties if available
+                    if (export is NormalExport normalExport && normalExport.Data != null)
+                    {
+                        foreach (var prop in normalExport.Data)
+                        {
+                            string propName = prop.Name?.Value?.Value ?? "";
+                            if (propName == "StaticMaterials" && prop is ArrayPropertyData arrayProp)
+                            {
+                                info["material_slots"] = arrayProp.Value?.Length ?? 0;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            
+            return new UAssetResponse { Success = true, Message = "Mesh info retrieved", Data = info };
         }
         catch (Exception ex)
         {
+            Console.Error.WriteLine($"[UAssetTool] Error in GetMeshInfo: {ex.Message}");
             return new UAssetResponse { Success = false, Message = $"Error: {ex.Message}" };
         }
     }
