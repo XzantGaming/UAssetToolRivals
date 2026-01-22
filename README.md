@@ -1,15 +1,17 @@
 # UAssetTool
 
-A unified command-line tool for parsing, editing, and converting Unreal Engine assets. Built on top of [UAssetAPI](https://github.com/atenfyr/UAssetAPI) with custom extensions for texture handling and Zen/IoStore support.
+A unified command-line tool for parsing, editing, and converting Unreal Engine assets. Built on top of [UAssetAPI](https://github.com/atenfyr/UAssetAPI) with custom extensions for texture handling and Zen/IoStore support. **Specifically optimized for Marvel Rivals modding.**
 
 ## Features
 
 - **Asset Detection** - Detect asset types (StaticMesh, SkeletalMesh, Texture2D, Blueprint, MaterialInstance)
 - **Property Editing** - Read and modify asset properties via JSON API
 - **Texture Operations** - Strip mipmaps, get texture info, detect inline data
-- **Mesh Operations** - Fix SerializeSize mismatches for static meshes
+- **Mesh Operations** - Fix SerializeSize mismatches, SkeletalMesh/StaticMesh material padding
 - **Zen/IoStore Support** - Convert between legacy (.uasset/.uexp) and Zen formats
+- **IoStore Creation** - Create IoStore mod bundles (.utoc/.ucas/.pak) for game injection
 - **IoStore Extraction** - Extract assets from game IoStore containers with dependency resolution
+- **Marvel Rivals Support** - Game-specific fixes for FGameplayTagContainer, material slots, and asset serialization
 - **GUI Backend** - JSON stdin/stdout API for frontend integration
 
 ## Installation
@@ -53,14 +55,52 @@ UAssetTool fix <uasset_path> [usmap_path]
 # Batch detect assets
 UAssetTool batch_detect <directory> [usmap_path]
 
-# Extract from IoStore with dependencies
-UAssetTool extract_iostore_legacy <utoc_path> <output_dir> --filter "Characters/1057" -deps
-
 # Convert legacy to Zen format
 UAssetTool to_zen <uasset_path> [usmap_path]
+```
 
-# Create IoStore bundle
-UAssetTool create_mod_iostore <output_base> <uasset_files...>
+### PAK Extraction
+
+```bash
+# Extract assets from legacy PAK file
+UAssetTool extract_pak <pak_path> <output_dir> [options]
+
+# List files in PAK without extracting
+UAssetTool extract_pak <pak_path> <output_dir> --list
+
+# Extract with AES decryption key
+UAssetTool extract_pak <pak_path> <output_dir> --aes "YOUR_AES_KEY"
+
+# Extract files matching patterns (space-separated, OR logic)
+UAssetTool extract_pak mod.pak output --filter SK_1036 MI_Body
+UAssetTool extract_pak mod.pak output --filter Meshes Textures Materials
+```
+
+**Options:**
+- `--aes <key>` - AES decryption key (hex string, 64 chars)
+- `--filter <patterns...>` - Only extract files matching patterns (space-separated, OR logic)
+- `--list` - List files only, don't extract
+
+Supports:
+- PAK version 11 (UE5 format)
+- Oodle, Zlib, Zstd compression
+- Encrypted and unencrypted PAKs
+- Multi-block compressed files
+
+### IoStore Commands
+
+```bash
+# Extract assets from game IoStore to legacy format
+UAssetTool extract_iostore_legacy <utoc_path> <output_dir> [options]
+
+# Create IoStore mod bundle from legacy assets
+UAssetTool create_mod_iostore <output_base> [options] <uasset_files...>
+
+# Inspect Zen package structure
+UAssetTool inspect_zen <ucas_path>
+
+# Extract script objects database
+UAssetTool extract_script_objects <paks_path> <output_file>
 ```
 
 ### Interactive JSON Mode
@@ -123,18 +163,91 @@ UAssetTool
 Extract assets from UE5 IoStore containers (`.utoc`/`.ucas`) to legacy format:
 
 ```bash
-# Extract specific folder with all dependencies
-UAssetTool extract_iostore_legacy "path/to/pakchunk0-Windows.utoc" "output_dir" --filter "Characters/1057" -deps
+# Extract specific assets by filter patterns (space-separated, OR logic)
+UAssetTool extract_iostore_legacy "C:/Game/Paks" "output_dir" --filter SK_1014 SK_1057 SK_1036
 
-# Extract all assets from container
-UAssetTool extract_iostore_legacy "path/to/pakchunk0-Windows.utoc" "output_dir"
+# Extract with dependencies
+UAssetTool extract_iostore_legacy "C:/Game/Paks" "output_dir" --filter Characters/1057 --with-deps
+
+# Extract multiple character meshes
+UAssetTool extract_iostore_legacy "C:/Game/Paks" "output_dir" --filter SK_1014_1014001 SK_1057_1057001
 ```
+
+**Arguments:**
+- `<paks_directory>` - Path to game's Paks directory (loads all .utoc files, top-level only)
+- `<output_dir>` - Output directory for extracted assets
+
+**Options:**
+- `--filter <patterns...>` - Only extract packages matching patterns (space-separated, OR logic, **required**)
+- `--with-deps` - Also extract imported/referenced packages
+- `--script-objects <path>` - Path to ScriptObjects.bin for import resolution
+- `--global <path>` - Path to global.utoc for script objects
+- `--container <path>` - Additional container to load for cross-package imports
 
 The tool automatically:
 - Loads all game containers for cross-container dependency resolution
-- Resolves import names correctly
-- Handles encrypted containers
+- Resolves import names correctly using script objects database
+- Handles encrypted containers with AES key
 - Extracts `.uasset`, `.uexp`, and `.ubulk` files
+- Converts Zen format to legacy format during extraction
+
+## IoStore Creation (Mod Bundling)
+
+Create IoStore mod bundles from legacy assets for injection into Marvel Rivals:
+
+```bash
+# Create mod bundle from single asset
+UAssetTool create_mod_iostore "output/MyMod" \
+    --usmap "path/to/mappings.usmap" \
+    "Content/Marvel/Characters/1014/Meshes/SK_1014_1014001.uasset"
+
+# Create mod bundle from multiple assets
+UAssetTool create_mod_iostore "output/MyMod" \
+    --usmap "path/to/mappings.usmap" \
+    "Content/Marvel/Textures/T_MyTexture.uasset" \
+    "Content/Marvel/Materials/MI_MyMaterial.uasset"
+
+# Create without compression (faster, larger files)
+UAssetTool create_mod_iostore "output/MyMod" \
+    --usmap "path/to/mappings.usmap" \
+    --no-compress \
+    "Content/Marvel/Characters/1014/Meshes/SK_1014_1014001.uasset"
+```
+
+**Options:**
+- `--usmap <path>` - Path to .usmap mappings file (required)
+- `--aes <key>` - AES encryption key (optional)
+- `--no-compress` - Disable Oodle compression (faster creation)
+
+**Output Files:**
+- `<output_base>.utoc` - Table of Contents
+- `<output_base>.ucas` - Container Archive Store (asset data)
+- `<output_base>.pak` - Companion PAK with chunk names
+
+**Installation:**
+Copy all three files to your game's `~mods` folder:
+```
+MarvelRivals/MarvelGame/Marvel/Content/Paks/~mods/
+├── MyMod.utoc
+├── MyMod.ucas
+└── MyMod.pak
+```
+
+## Zen Package Inspection
+
+Inspect the internal structure of Zen packages:
+
+```bash
+UAssetTool inspect_zen "path/to/file.ucas"
+```
+
+Shows:
+- Container version and header information
+- Package summary (flags, offsets)
+- Name map entries
+- Export map with serial offsets and sizes
+- Export bundle entries
+- Dependency information
 
 ## Project Structure
 
@@ -160,12 +273,27 @@ This fork includes custom extensions beyond standard UAssetAPI:
 - Marvel Rivals specific texture parsing (LightingGuid, bCooked format)
 - Mipmap stripping with correct SerialSize calculation
 - FTexturePlatformData detailed parsing
+- Automatic mipmap removal for texture mods
+
+### Mesh Handling
+- **SkeletalMesh**: FGameplayTagContainer padding (Marvel Rivals specific)
+- **StaticMesh**: FStaticMaterial struct handling
+- SerialSize recalculation for modified meshes
+- Material slot padding for game compatibility
 
 ### Zen/IoStore
-- Full Zen package header parsing
-- Cross-container import resolution
-- Legacy to Zen conversion
-- IoStore bundle creation
+- Full Zen package header parsing (UE5.3+ NoExportInfo version)
+- Cross-container import resolution via script objects database
+- Legacy to Zen conversion with correct export bundling
+- IoStore bundle creation with Oodle compression
+- Export bundle dependency ordering
+- Public export hash calculation
+
+### Marvel Rivals Specific
+- FGameplayTagContainer serialization (empty container = 4 bytes)
+- PackageGuid zeroing for cooked assets
+- CookedHeaderSize calculation for preload data
+- Script object hash lookup using full paths
 
 ## Dependencies
 

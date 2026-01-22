@@ -364,6 +364,22 @@ public class FZenPackageContext : IDisposable
     }
 
     /// <summary>
+    /// Find package ID by searching indexed paths (case-insensitive partial match)
+    /// </summary>
+    public ulong? FindPackageIdByPath(string searchPath)
+    {
+        string searchLower = searchPath.ToLowerInvariant();
+        foreach (var kvp in _packageIdToPath)
+        {
+            if (kvp.Value.ToLowerInvariant().Contains(searchLower))
+            {
+                return kvp.Key;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Get all package IDs
     /// </summary>
     public IEnumerable<ulong> GetAllPackageIds()
@@ -385,6 +401,60 @@ public class FZenPackageContext : IDisposable
     /// Get the index of the last loaded container (typically the mod container)
     /// </summary>
     public int LastContainerIndex => _containers.Count - 1;
+    
+    /// <summary>
+    /// Read bulk data chunk for a package (combines all BulkData chunks with different indices)
+    /// </summary>
+    public byte[]? ReadBulkData(ulong packageId)
+    {
+        // Find which container has this package
+        if (!_packageIdToChunk.TryGetValue(packageId, out var location))
+            return null;
+            
+        var reader = _containers[location.ContainerIndex];
+        
+        // Collect all BulkData chunks for this package (may have multiple with different indices)
+        var bulkChunks = new List<(ushort Index, byte[] Data)>();
+        
+        foreach (var chunk in reader.GetChunks())
+        {
+            // Check if this is a BulkData chunk for our package
+            if (chunk.GetChunkType() == IoStore.EIoChunkType.BulkData && chunk.Id == packageId)
+            {
+                try
+                {
+                    byte[] data = reader.ReadChunk(chunk);
+                    bulkChunks.Add((chunk.Index, data));
+                }
+                catch
+                {
+                    // Skip failed chunks
+                }
+            }
+        }
+        
+        if (bulkChunks.Count == 0)
+            return null;
+            
+        // Sort by index and concatenate
+        bulkChunks.Sort((a, b) => a.Index.CompareTo(b.Index));
+        
+        if (bulkChunks.Count == 1)
+            return bulkChunks[0].Data;
+            
+        // Concatenate all chunks
+        int totalSize = bulkChunks.Sum(c => c.Data.Length);
+        byte[] result = new byte[totalSize];
+        int offset = 0;
+        foreach (var (_, data) in bulkChunks)
+        {
+            Array.Copy(data, 0, result, offset, data.Length);
+            offset += data.Length;
+        }
+        
+        Console.WriteLine($"[Context] Combined {bulkChunks.Count} BulkData chunks into {totalSize} bytes");
+        return result;
+    }
 
     /// <summary>
     /// Resolve a package import to the actual export in the referenced package

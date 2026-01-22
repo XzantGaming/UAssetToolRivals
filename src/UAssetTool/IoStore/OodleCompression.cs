@@ -264,7 +264,7 @@ public static class OodleCompression
                     outputHandle.AddrOfPinnedObject(),
                     (IntPtr)uncompressedSize,
                     1, // fuzzSafe
-                    1, // checkCRC
+                    0, // checkCRC - disable CRC check
                     0, // verbosity
                     IntPtr.Zero,
                     IntPtr.Zero,
@@ -272,12 +272,28 @@ public static class OodleCompression
                     IntPtr.Zero,
                     IntPtr.Zero,
                     IntPtr.Zero,
-                    3); // threadPhase
+                    0); // threadPhase
 
-                if (decompressedSize.ToInt64() != uncompressedSize)
+                long actualSize = decompressedSize.ToInt64();
+                if (actualSize <= 0)
+                {
+                    Console.Error.WriteLine($"[Oodle] Decompression returned {actualSize}, expected {uncompressedSize}");
                     return null;
+                }
+                
+                // If size matches, return as-is
+                if (actualSize == uncompressedSize)
+                    return output;
+                
+                // If size is different but positive, resize and return
+                if (actualSize > 0 && actualSize <= uncompressedSize)
+                {
+                    Array.Resize(ref output, (int)actualSize);
+                    return output;
+                }
 
-                return output;
+                Console.Error.WriteLine($"[Oodle] Size mismatch: got {actualSize}, expected {uncompressedSize}");
+                return null;
             }
             finally
             {

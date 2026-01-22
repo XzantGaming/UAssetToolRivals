@@ -65,7 +65,7 @@
     </Exec>
     <WriteLinesToFile File="$(ProjectDir)git_commit.txt" Overwrite="true" Lines="$(GitCommit)" />
   </Target>
-  <Target Name="AfterBuildMigrated" AfterTargets="Build">
+  <Target Name="AfterBuildMigrated" AfterTargets="Build" Condition="'$(PublishDir)' == ''">
     <Delete Files="$(ProjectDir)git_commit.txt" />
   </Target>
   <ItemGroup>

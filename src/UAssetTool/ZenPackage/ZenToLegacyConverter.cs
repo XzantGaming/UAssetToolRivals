@@ -84,7 +84,20 @@ public class ZenToLegacyConverter
         ResolveExportDependencies();
         FinalizeAsset();
         
-        return SerializeAsset();
+        var bundle = SerializeAsset();
+        
+        // Extract bulk data from IoStore if available
+        if (_context != null && _packageId != 0)
+        {
+            byte[]? bulkData = _context.ReadBulkData(_packageId);
+            if (bulkData != null && bulkData.Length > 0)
+            {
+                bundle.BulkData = bulkData;
+                Console.WriteLine($"[ZenToLegacy] Extracted {bulkData.Length} bytes of bulk data");
+            }
+        }
+        
+        return bundle;
     }
 
     /// <summary>

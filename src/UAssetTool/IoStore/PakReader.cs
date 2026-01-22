@@ -32,6 +32,9 @@ public class PakReader : IDisposable
     
     // Index data
     private readonly Dictionary<string, PakEntry> _entries = new();
+    
+    // Compression methods from footer
+    private readonly string[] _compressionMethods = new string[5];
 
     public PakReader(string pakPath, string? aesKeyHex = null)
         : this(File.OpenRead(pakPath), aesKeyHex, ownsStream: true)
@@ -107,10 +110,19 @@ public class PakReader : IDisposable
         // 1. Read footer (at end of file)
         ReadFooter(reader, out long indexOffset, out ulong indexSize, out byte[] expectedIndexHash);
 
-        // 2. Read and decrypt index
+        // 2. Read index (decrypt if encrypted)
         _stream.Seek(indexOffset, SeekOrigin.Begin);
-        byte[] encryptedIndex = reader.ReadBytes((int)indexSize);
-        byte[] indexData = AesDecrypt(encryptedIndex, _aesKey);
+        byte[] rawIndex = reader.ReadBytes((int)indexSize);
+        byte[] indexData;
+        
+        if (EncryptedIndex)
+        {
+            indexData = AesDecrypt(rawIndex, _aesKey);
+        }
+        else
+        {
+            indexData = rawIndex;
+        }
 
         // Verify index hash
         byte[] actualIndexHash = SHA1.HashData(indexData);
@@ -162,8 +174,14 @@ public class PakReader : IDisposable
         // Index hash (20 bytes)
         indexHash = reader.ReadBytes(20);
 
-        // Skip compression methods (5 * 32 = 160 bytes)
-        // We'll detect compression from entries
+        // Read compression methods (5 * 32 = 160 bytes)
+        for (int i = 0; i < 5; i++)
+        {
+            byte[] methodBytes = reader.ReadBytes(32);
+            int nullIndex = Array.IndexOf(methodBytes, (byte)0);
+            if (nullIndex < 0) nullIndex = 32;
+            _compressionMethods[i] = Encoding.ASCII.GetString(methodBytes, 0, nullIndex);
+        }
     }
 
     /// <summary>
@@ -213,12 +231,12 @@ public class PakReader : IDisposable
         // Unused file count
         uint unusedFileCount = indexReader.ReadUInt32();
 
-        // Read and decrypt path hash index to get file paths
+        // Read path hash index to get file paths (decrypt only if index is encrypted)
         if (hasPathHashIndex != 0 && pathHashIndexSize > 0)
         {
             _stream.Seek(pathHashIndexOffset, SeekOrigin.Begin);
-            byte[] encryptedPhi = dataReader.ReadBytes((int)pathHashIndexSize);
-            byte[] phiData = AesDecrypt(encryptedPhi, _aesKey);
+            byte[] rawPhi = dataReader.ReadBytes((int)pathHashIndexSize);
+            byte[] phiData = EncryptedIndex ? AesDecrypt(rawPhi, _aesKey) : rawPhi;
 
             using var phiStream = new MemoryStream(phiData);
             using var phiReader = new BinaryReader(phiStream);
@@ -234,12 +252,12 @@ public class PakReader : IDisposable
             }
         }
 
-        // Read and decrypt full directory index to get file paths and entry offsets
+        // Read full directory index to get file paths and entry offsets (decrypt only if index is encrypted)
         if (hasFullDirectoryIndex != 0 && fullDirectoryIndexSize > 0)
         {
             _stream.Seek(fullDirectoryIndexOffset, SeekOrigin.Begin);
-            byte[] encryptedFdi = dataReader.ReadBytes((int)fullDirectoryIndexSize);
-            byte[] fdiData = AesDecrypt(encryptedFdi, _aesKey);
+            byte[] rawFdi = dataReader.ReadBytes((int)fullDirectoryIndexSize);
+            byte[] fdiData = EncryptedIndex ? AesDecrypt(rawFdi, _aesKey) : rawFdi;
 
             using var fdiStream = new MemoryStream(fdiData);
             using var fdiReader = new BinaryReader(fdiStream);
@@ -267,6 +285,15 @@ public class PakReader : IDisposable
         }
 
         Console.Error.WriteLine($"[PakReader] Loaded {_entries.Count} entries from PAK");
+        Console.Error.WriteLine($"[PakReader] Compression methods: [{string.Join(", ", _compressionMethods.Where(m => !string.IsNullOrEmpty(m)))}]");
+        
+        // Debug: print first few entries
+        int debugCount = 0;
+        foreach (var kvp in _entries)
+        {
+            if (debugCount++ >= 3) break;
+            Console.Error.WriteLine($"[PakReader] Entry '{kvp.Key}': Offset={kvp.Value.Offset}, Compressed={kvp.Value.CompressedSize}, Uncompressed={kvp.Value.UncompressedSize}, CompressionSlot={kvp.Value.CompressionSlot}, BlockSize={kvp.Value.CompressionBlockSize}, BlockCount={kvp.Value.CompressionBlocksCount}");
+        }
     }
 
     /// <summary>
@@ -279,8 +306,10 @@ public class PakReader : IDisposable
 
         uint flags = reader.ReadUInt32();
 
-        // Extract flags
-        uint compressionBlockSize = flags & 0x3F;
+        // Extract flags (based on CUE4Parse FPakEntry.cs)
+        // compressionBlockSize is stored as value << 11 (not << 10)
+        // So we extract the raw value and will shift by 11 when using it
+        uint compressionBlockSizeRaw = flags & 0x3F;
         uint compressionBlocksCount = (flags >> 6) & 0xFFFF;
         bool isEncrypted = ((flags >> 22) & 1) != 0;
         uint compressionSlot = (flags >> 23) & 0x3F;
@@ -308,55 +337,131 @@ public class PakReader : IDisposable
             UncompressedSize = uncompressedSize,
             CompressionSlot = compressionSlot > 0 ? (int?)(compressionSlot - 1) : null,
             IsEncrypted = isEncrypted,
-            CompressionBlockSize = compressionBlockSize,
+            CompressionBlockSize = compressionBlockSizeRaw,
             CompressionBlocksCount = compressionBlocksCount
         };
     }
 
     /// <summary>
-    /// Read entry data from PAK file
+    /// Read entry data from PAK file using entry info from index
     /// </summary>
     private byte[] ReadEntryData(PakEntry entry, string path)
     {
+        // Use the entry info from the index (already parsed from encoded entries)
+        ulong uncompressedSize = entry.UncompressedSize;
+        ulong compressedSize = entry.CompressedSize;
+        bool isCompressed = entry.CompressionSlot.HasValue;
+        bool isEncrypted = entry.IsEncrypted;
+        uint compressionMethod = isCompressed ? (uint)(entry.CompressionSlot!.Value + 1) : 0;
+
+        // Handle empty files
+        if (uncompressedSize == 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        // Seek to entry offset
         _stream.Seek((long)entry.Offset, SeekOrigin.Begin);
         using var reader = new BinaryReader(_stream, Encoding.UTF8, leaveOpen: true);
+        
+        // Read FPakEntry header (Unreal Packaging format - no flags byte):
+        // offset(8) + compressed(8) + uncompressed(8) + compression(4) + hash(20) = 48 bytes
+        // Then if compressed: blockCount(4) + blocks(16 each)
+        reader.ReadBytes(48); // Skip to block count
 
-        // Read FPakEntry record first (53 bytes for V11 uncompressed)
-        // offset(8) + compressed(8) + uncompressed(8) + compression(4) + hash(20) + flags(1) + blocksize(4)
-        ulong recordOffset = reader.ReadUInt64();
-        ulong recordCompressed = reader.ReadUInt64();
-        ulong recordUncompressed = reader.ReadUInt64();
-        uint compressionMethod = reader.ReadUInt32();
-        byte[] dataHash = reader.ReadBytes(20);
-        byte flags = reader.ReadByte();
-        uint blockSize = reader.ReadUInt32();
-
-        bool isEncrypted = (flags & 1) != 0;
-
-        // Read the data
-        byte[] data = reader.ReadBytes((int)recordCompressed);
-
-        // Decrypt if needed
-        if (isEncrypted)
+        if (!isCompressed)
         {
-            data = PartialDecrypt(data, path);
+            // Uncompressed: data follows directly after header
+            byte[] data = reader.ReadBytes((int)uncompressedSize);
+            if (isEncrypted)
+            {
+                data = PartialDecrypt(data, path);
+            }
+            return data;
         }
 
-        // Decompress if needed
-        if (compressionMethod != 0)
+        // Compressed: read compression blocks info then decompress
+        uint blockCount = reader.ReadUInt32();
+        var compressionBlocks = new List<(long start, long end)>((int)blockCount);
+        for (uint i = 0; i < blockCount; i++)
         {
-            data = Decompress(data, (int)recordUncompressed, compressionMethod);
+            long blockStart = reader.ReadInt64();
+            long blockEnd = reader.ReadInt64();
+            compressionBlocks.Add((blockStart, blockEnd));
         }
 
-        // Trim to actual size (remove padding)
-        if (data.Length > (int)recordUncompressed)
+        // Block size: use 65536 (64KB) as default - this is the standard UE4/5 block size
+        // The CompressionBlockSize field is shifted left by 11 (per CUE4Parse FPakEntry.cs)
+        uint blockSize;
+        if (entry.CompressionBlockSize > 0)
         {
-            byte[] trimmed = new byte[recordUncompressed];
-            Array.Copy(data, trimmed, (int)recordUncompressed);
-            return trimmed;
+            blockSize = entry.CompressionBlockSize << 11; // 32 << 11 = 65536
+        }
+        else
+        {
+            // Default to 64KB which is the standard UE4/5 compression block size
+            blockSize = 65536;
         }
 
-        return data;
+        // Decompress each block
+        using var outputStream = new MemoryStream((int)uncompressedSize);
+        long entryBaseOffset = (long)entry.Offset;
+
+        for (int blockIdx = 0; blockIdx < compressionBlocks.Count; blockIdx++)
+        {
+            var (blockStart, blockEnd) = compressionBlocks[blockIdx];
+            
+            // Block offsets are RELATIVE to entry start position
+            long absoluteBlockStart = entryBaseOffset + blockStart;
+            long blockCompressedSize = blockEnd - blockStart;
+            
+            if (blockCompressedSize <= 0)
+                continue;
+            
+            // Read block data directly from stream
+            _stream.Seek(absoluteBlockStart, SeekOrigin.Begin);
+            byte[] blockData = new byte[blockCompressedSize];
+            int bytesRead = _stream.Read(blockData, 0, (int)blockCompressedSize);
+            if (bytesRead != blockCompressedSize)
+            {
+                throw new InvalidDataException($"Failed to read block {blockIdx}: expected {blockCompressedSize} bytes, got {bytesRead}");
+            }
+
+            if (isEncrypted)
+            {
+                int alignedSize = ((int)blockCompressedSize + 15) & ~15;
+                if (blockData.Length < alignedSize)
+                {
+                    Array.Resize(ref blockData, alignedSize);
+                }
+                blockData = AesDecrypt(blockData, _aesKey);
+                if (blockData.Length > blockCompressedSize)
+                {
+                    Array.Resize(ref blockData, (int)blockCompressedSize);
+                }
+            }
+
+            // Calculate expected uncompressed size for this block
+            // Last block may be smaller than blockSize
+            long remainingUncompressed = (long)uncompressedSize - outputStream.Position;
+            int blockUncompressedSize = (int)Math.Min(blockSize, remainingUncompressed);
+            
+            if (blockUncompressedSize <= 0)
+                continue;
+
+            try
+            {
+                byte[] decompressedBlock = Decompress(blockData, blockUncompressedSize, compressionMethod);
+                outputStream.Write(decompressedBlock, 0, decompressedBlock.Length);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[PakReader] Block {blockIdx} decompression failed: compressed={blockCompressedSize}, uncompressed={blockUncompressedSize}, method={compressionMethod}");
+                throw;
+            }
+        }
+
+        return outputStream.ToArray();
     }
 
     /// <summary>
@@ -468,30 +573,37 @@ public class PakReader : IDisposable
     }
 
     /// <summary>
-    /// Decompress data using the specified compression method
+    /// Decompress data using the specified compression method index
     /// </summary>
-    private static byte[] Decompress(byte[] data, int uncompressedSize, uint compressionMethod)
+    private byte[] Decompress(byte[] data, int uncompressedSize, uint compressionMethodIndex)
     {
-        // Compression methods from repak:
-        // 0 = None
-        // 1 = Zlib
-        // 2 = Gzip  
-        // 3 = Oodle
-        // 4 = LZ4
-
-        switch (compressionMethod)
-        {
-            case 0:
-                return data;
-            case 1: // Zlib
-                return DecompressZlib(data, uncompressedSize);
-            case 3: // Oodle
-                return DecompressOodle(data, uncompressedSize);
-            case 4: // LZ4
-                return DecompressLz4(data, uncompressedSize);
-            default:
-                throw new NotSupportedException($"Compression method {compressionMethod} not supported");
-        }
+        // compressionMethodIndex is 1-based index into _compressionMethods array
+        // 0 = no compression
+        if (compressionMethodIndex == 0)
+            return data;
+            
+        int methodIdx = (int)compressionMethodIndex - 1;
+        if (methodIdx < 0 || methodIdx >= _compressionMethods.Length)
+            throw new NotSupportedException($"Compression method index {compressionMethodIndex} out of range");
+            
+        string methodName = _compressionMethods[methodIdx];
+        
+        if (string.IsNullOrEmpty(methodName))
+            throw new NotSupportedException($"Compression method at index {methodIdx} is empty");
+        
+        // Match by name (case-insensitive)
+        if (methodName.Equals("Zlib", StringComparison.OrdinalIgnoreCase))
+            return DecompressZlib(data, uncompressedSize);
+        else if (methodName.Equals("Oodle", StringComparison.OrdinalIgnoreCase))
+            return DecompressOodle(data, uncompressedSize);
+        else if (methodName.Equals("Gzip", StringComparison.OrdinalIgnoreCase))
+            return DecompressZlib(data, uncompressedSize); // Gzip uses same decompressor
+        else if (methodName.Equals("LZ4", StringComparison.OrdinalIgnoreCase))
+            return DecompressLz4(data, uncompressedSize);
+        else if (methodName.Equals("Zstd", StringComparison.OrdinalIgnoreCase))
+            return DecompressZstd(data, uncompressedSize);
+        else
+            throw new NotSupportedException($"Compression method '{methodName}' not supported");
     }
 
     private static byte[] DecompressZlib(byte[] data, int uncompressedSize)
@@ -505,15 +617,11 @@ public class PakReader : IDisposable
 
     private static byte[] DecompressOodle(byte[] data, int uncompressedSize)
     {
-        // Use oodle_loader via P/Invoke or external call
-        // For now, try to find and use oo2core DLL
-        byte[] output = new byte[uncompressedSize];
-        
-        int result = OodleDecompress(data, data.Length, output, uncompressedSize);
-        if (result != uncompressedSize)
-            throw new InvalidDataException($"Oodle decompression failed: got {result}, expected {uncompressedSize}");
-        
-        return output;
+        // Use the OodleCompression class which handles DLL loading/downloading
+        byte[]? result = OodleCompression.Decompress(data, uncompressedSize);
+        if (result == null)
+            throw new InvalidDataException($"Oodle decompression failed. Make sure oo2core_9_win64.dll is available.");
+        return result;
     }
 
     private static byte[] DecompressLz4(byte[] data, int uncompressedSize)
@@ -523,27 +631,10 @@ public class PakReader : IDisposable
         throw new NotSupportedException("LZ4 decompression not yet implemented. Add K4os.Compression.LZ4 package.");
     }
 
-    // Oodle P/Invoke
-    [System.Runtime.InteropServices.DllImport("oo2core_9_win64.dll", CallingConvention = System.Runtime.InteropServices.CallingConvention.Cdecl)]
-    private static extern int OodleLZ_Decompress(
-        byte[] srcBuf, long srcLen,
-        byte[] dstBuf, long dstLen,
-        int fuzzSafe, int checkCRC, int verbosity,
-        IntPtr decBufBase, long decBufSize,
-        IntPtr fpCallback, IntPtr callbackUserData,
-        IntPtr decoderMemory, long decoderMemorySize,
-        int threadPhase);
-
-    private static int OodleDecompress(byte[] compressed, int compressedSize, byte[] decompressed, int decompressedSize)
+    private static byte[] DecompressZstd(byte[] data, int uncompressedSize)
     {
-        return OodleLZ_Decompress(
-            compressed, compressedSize,
-            decompressed, decompressedSize,
-            1, 0, 0,
-            IntPtr.Zero, 0,
-            IntPtr.Zero, IntPtr.Zero,
-            IntPtr.Zero, 0,
-            0);
+        using var decompressor = new ZstdSharp.Decompressor();
+        return decompressor.Unwrap(data).ToArray();
     }
 
     public void Dispose()

@@ -65,6 +65,8 @@ public class Program
                 "recompress_iostore" => CliRecompressIoStore(args),
                 "cityhash" => CliCityHash(args),
                 "from_json" => CliFromJson(args),
+                "dump_zen_from_game" => CliDumpZenFromGame(args),
+                "extract_pak" => CliExtractPak(args),
                 "help" or "--help" or "-h" => CliHelp(),
                 _ => throw new Exception($"Unknown command: {command}")
             };
@@ -102,6 +104,7 @@ public class Program
         Console.WriteLine("  extract_script_objects <paks_path> <output>    - Extract ScriptObjects.bin from game");
         Console.WriteLine("  recompress_iostore <utoc_path>                 - Recompress IoStore with Oodle");
         Console.WriteLine("  from_json <json_path> <output_uasset> [usmap]  - Convert JSON back to uasset");
+        Console.WriteLine("  extract_pak <pak_path> <output_dir> [options]   - Extract assets from legacy PAK file");
         Console.WriteLine();
         Console.WriteLine("Zen Conversion Pipeline (2 steps for debugging):");
         Console.WriteLine("  Step 1: to_zen    - Legacy .uasset/.uexp -> .uzenasset");
@@ -757,10 +760,11 @@ public class Program
     {
         if (args.Length < 3)
         {
-            Console.Error.WriteLine("Usage: UAssetTool extract_iostore <utoc_path> <output_dir> [--chunk-id <id>] [--package <name>]");
+            Console.Error.WriteLine("Usage: UAssetTool extract_iostore <utoc_path> <output_dir> [--chunk-id <id>] [--package <name>] [--aes <hex>]");
             Console.Error.WriteLine("Examples:");
             Console.Error.WriteLine("  UAssetTool extract_iostore pakchunk0-WindowsClient.utoc ./extracted");
             Console.Error.WriteLine("  UAssetTool extract_iostore pakchunk0-WindowsClient.utoc ./extracted --package /Game/Marvel/Characters/1033/1033001/Weapons/Stick_L/Meshes/SM_WP_1033001_Stick_L");
+            Console.Error.WriteLine("  UAssetTool extract_iostore pakchunk0-WindowsClient.utoc ./extracted --aes 0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74 --package /Game/...");
             return 1;
         }
 
@@ -768,6 +772,7 @@ public class Program
         string outputDir = args[2];
         string? packageName = null;
         string? chunkIdHex = null;
+        string? aesKeyHex = null;
 
         for (int i = 3; i < args.Length; i++)
         {
@@ -775,11 +780,14 @@ public class Program
                 packageName = args[++i];
             else if (args[i] == "--chunk-id" && i + 1 < args.Length)
                 chunkIdHex = args[++i];
+            else if ((args[i] == "--aes" || args[i] == "--aes-key") && i + 1 < args.Length)
+                aesKeyHex = args[++i];
         }
 
         try
         {
-            using var reader = new IoStore.IoStoreReader(utocPath);
+            byte[]? aesKey = aesKeyHex != null ? Convert.FromHexString(aesKeyHex) : null;
+            using var reader = new IoStore.IoStoreReader(utocPath, aesKey);
             Console.WriteLine($"Opened IoStore: {reader.ContainerName}");
             Console.WriteLine($"  TOC Version: {reader.Toc.Version}");
             Console.WriteLine($"  Chunks: {reader.Toc.Chunks.Count}");
@@ -976,25 +984,32 @@ public class Program
     {
         if (args.Length < 3)
         {
-            Console.Error.WriteLine("Usage: UAssetTool extract_iostore_legacy <utoc_path> <output_dir> [options]");
+            Console.Error.WriteLine("Usage: UAssetTool extract_iostore_legacy <paks_directory> <output_dir> [options]");
             Console.Error.WriteLine("Extracts IoStore packages and converts them to legacy .uasset/.uexp format");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Arguments:");
+            Console.Error.WriteLine("  <paks_directory>         Path to game's Paks directory (loads all .utoc files)");
+            Console.Error.WriteLine("  <output_dir>             Output directory for extracted assets");
+            Console.Error.WriteLine();
             Console.Error.WriteLine("Options:");
-            Console.Error.WriteLine("  --game-path <path>       Path to game's Paks directory (loads all .utoc files)");
             Console.Error.WriteLine("  --script-objects <path>  Path to ScriptObjects.bin for import resolution");
             Console.Error.WriteLine("  --global <path>          Path to global.utoc for script objects");
             Console.Error.WriteLine("  --container <path>       Additional container to load for cross-package imports");
-            Console.Error.WriteLine("  --filter <pattern>       Only extract packages matching pattern (e.g. 'NS_104871')");
+            Console.Error.WriteLine("  --filter <patterns...>   Only extract packages matching patterns (space-separated)");
             Console.Error.WriteLine("  --with-deps              Also extract imported/referenced packages");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Examples:");
+            Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter SK_1014 SK_1057 SK_1036");
+            Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter Characters/1014 Characters/1057");
             return 1;
         }
 
-        string utocPath = args[1];
+        string paksPath = args[1];
         string outputDir = args[2];
         string? scriptObjectsPath = null;
         string? globalUtocPath = null;
-        string? gamePaksPath = null;
         List<string> additionalContainers = new();
-        string? filterPattern = null;
+        List<string> filterPatterns = new();
         bool extractDependencies = false;
 
         for (int i = 3; i < args.Length; i++)
@@ -1003,16 +1018,27 @@ public class Program
                 scriptObjectsPath = args[++i];
             else if (args[i] == "--global" && i + 1 < args.Length)
                 globalUtocPath = args[++i];
-            else if (args[i] == "--game-path" && i + 1 < args.Length)
-                gamePaksPath = args[++i];
             else if (args[i] == "--container" && i + 1 < args.Length)
                 additionalContainers.Add(args[++i]);
-            else if (args[i] == "--filter" && i + 1 < args.Length)
-                filterPattern = args[++i];
-            else if (args[i] == "-deps")
+            else if (args[i] == "--filter" || args[i] == "--package")
+            {
+                // Collect all following args until next option (starts with --)
+                while (i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+                {
+                    filterPatterns.Add(args[++i]);
+                }
+            }
+            else if (args[i] == "-deps" || args[i] == "--with-deps")
                 extractDependencies = true;
         }
 
+        // Validate paks path
+        if (!Directory.Exists(paksPath))
+        {
+            Console.Error.WriteLine($"Paks directory not found: {paksPath}");
+            return 1;
+        }
+        
         try
         {
             // Create package context for proper import resolution
@@ -1021,63 +1047,35 @@ public class Program
             // Set Marvel Rivals AES key for encrypted containers
             context.SetAesKey("0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74");
             
-            // Auto-detect game Paks directory from main container path if not explicitly provided
-            if (string.IsNullOrEmpty(gamePaksPath))
+            Console.WriteLine($"Loading game containers from: {paksPath}");
+            
+            // Load global.utoc first for script objects
+            string globalPath = Path.Combine(paksPath, "global.utoc");
+            if (File.Exists(globalPath))
             {
-                string? containerDir = Path.GetDirectoryName(utocPath);
-                if (!string.IsNullOrEmpty(containerDir) && containerDir.EndsWith("Paks", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Check if this looks like a game Paks folder (has multiple .utoc files)
-                    int utocCount = Directory.GetFiles(containerDir, "*.utoc").Length;
-                    if (utocCount > 5)
-                    {
-                        gamePaksPath = containerDir;
-                        Console.WriteLine($"Auto-detected game Paks directory: {gamePaksPath}");
-                    }
-                }
+                Console.WriteLine($"  Loading global.utoc...");
+                context.LoadContainer(globalPath);
+                context.LoadScriptObjectsFromContainer(0);
             }
             
-            // Track which container index is our main extraction target
-            int mainContainerIndex = -1;
-            string mainContainerName = Path.GetFileNameWithoutExtension(utocPath);
+            // Load other game containers (only top-level, not subfolders)
+            // Include optional chunks when extracting dependencies
+            var utocFiles = Directory.GetFiles(paksPath, "*.utoc", SearchOption.TopDirectoryOnly)
+                .Where(f => !f.EndsWith("global.utoc", StringComparison.OrdinalIgnoreCase))
+                .Where(f => extractDependencies || !f.Contains("optional", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(f => f)
+                .ToList();
             
-            // Load game containers from Paks directory if provided or auto-detected
-            if (!string.IsNullOrEmpty(gamePaksPath) && Directory.Exists(gamePaksPath))
+            Console.WriteLine($"  Loading {utocFiles.Count} game containers...");
+            foreach (var utocFile in utocFiles)
             {
-                Console.WriteLine($"Loading game containers from: {gamePaksPath}");
-                
-                // Load global.utoc first for script objects
-                string globalPath = Path.Combine(gamePaksPath, "global.utoc");
-                if (File.Exists(globalPath))
+                try
                 {
-                    Console.WriteLine($"  Loading global.utoc...");
-                    context.LoadContainer(globalPath);
-                    context.LoadScriptObjectsFromContainer(0);
+                    context.LoadContainer(utocFile);
                 }
-                
-                // Load other game containers (include optional chunks when extracting dependencies)
-                var utocFiles = Directory.GetFiles(gamePaksPath, "*.utoc")
-                    .Where(f => !f.EndsWith("global.utoc", StringComparison.OrdinalIgnoreCase))
-                    .Where(f => extractDependencies || !f.Contains("optional", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(f => f)
-                    .ToList();
-                
-                Console.WriteLine($"  Loading {utocFiles.Count} game containers...");
-                foreach (var utocFile in utocFiles)
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        context.LoadContainer(utocFile);
-                        // Track if this is our main extraction target
-                        if (Path.GetFileNameWithoutExtension(utocFile).Equals(mainContainerName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            mainContainerIndex = context.LastContainerIndex;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.Error.WriteLine($"  Warning: Failed to load {Path.GetFileName(utocFile)}: {ex.Message}");
-                    }
+                    Console.Error.WriteLine($"  Warning: Failed to load {Path.GetFileName(utocFile)}: {ex.Message}");
                 }
             }
             
@@ -1106,18 +1104,7 @@ public class Program
                 }
             }
             
-            // Load the main container if not already loaded as part of game containers
-            if (mainContainerIndex < 0)
-            {
-                Console.WriteLine($"Loading main container: {utocPath}");
-                context.LoadContainer(utocPath);
-                mainContainerIndex = context.LastContainerIndex;
-            }
-            else
-            {
-                Console.WriteLine($"Main container already loaded as part of game containers (index {mainContainerIndex})");
-            }
-            
+            Console.WriteLine($"Total containers loaded: {context.ContainerCount}");
             Console.WriteLine($"Total packages indexed: {context.PackageCount}");
 
             Directory.CreateDirectory(outputDir);
@@ -1130,20 +1117,70 @@ public class Program
             HashSet<ulong> extractedPackages = new();
             HashSet<ulong> pendingDependencies = new();
             
-            // Get package IDs from ALL containers (for cross-container extraction with filter)
-            // or just main container if no filter specified
+            // Get package IDs to extract
             List<ulong> packageIds;
-            if (!string.IsNullOrEmpty(filterPattern))
+            bool skipFilterCheck = false; // Skip filter check in ExtractPackage if we already filtered
+            if (filterPatterns.Count > 0)
             {
-                // When filter is specified, search across ALL loaded containers
-                packageIds = context.GetAllPackageIds().ToList();
-                Console.WriteLine($"Searching {packageIds.Count} packages across all containers for filter '{filterPattern}'...");
+                packageIds = new List<ulong>();
+                
+                foreach (var filterPattern in filterPatterns)
+                {
+                    // Check if filter looks like an exact package path (starts with /Game/)
+                    if (filterPattern.StartsWith("/Game/"))
+                    {
+                        // Direct lookup by package path - much faster than iterating all packages
+                        ulong packageId = ZenPackage.FPackageId.FromName(filterPattern);
+                        if (context.HasPackage(packageId))
+                        {
+                            if (!packageIds.Contains(packageId))
+                                packageIds.Add(packageId);
+                            Console.WriteLine($"Direct lookup: found package {filterPattern}");
+                        }
+                        else
+                        {
+                            // Try partial match as fallback
+                            var found = context.FindPackageIdByPath(filterPattern);
+                            if (found.HasValue && !packageIds.Contains(found.Value))
+                            {
+                                packageIds.Add(found.Value);
+                                Console.WriteLine($"Found package by partial match: {context.GetPackagePath(found.Value)}");
+                            }
+                            else if (!found.HasValue)
+                            {
+                                Console.Error.WriteLine($"Warning: Package not found: {filterPattern}");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Partial filter - search through all packages (slower)
+                        int matchCount = 0;
+                        foreach (var pkgId in context.GetAllPackageIds())
+                        {
+                            string? path = context.GetPackagePath(pkgId);
+                            if (!string.IsNullOrEmpty(path) && path.Contains(filterPattern, StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (!packageIds.Contains(pkgId))
+                                {
+                                    packageIds.Add(pkgId);
+                                    matchCount++;
+                                }
+                            }
+                        }
+                        Console.WriteLine($"Filter '{filterPattern}' matched {matchCount} packages");
+                    }
+                }
+                
+                skipFilterCheck = true; // Already filtered
+                Console.WriteLine($"Total packages matching filters [{string.Join(", ", filterPatterns)}]: {packageIds.Count}");
             }
             else
             {
-                // No filter - only extract from main container
-                packageIds = context.GetPackageIdsFromContainer(mainContainerIndex).ToList();
-                Console.WriteLine($"Extracting {packageIds.Count} packages from main container...");
+                // No filter specified - require at least one filter to avoid extracting entire game
+                Console.Error.WriteLine("Error: No filter specified. Use --filter to specify which packages to extract.");
+                Console.Error.WriteLine("Example: --filter SK_1014 SK_1057");
+                return 1;
             }
 
             // Helper function to extract a single package
@@ -1157,10 +1194,12 @@ public class Program
                 // Get full package path from TOC directory index if available
                 string? fullPath = context.GetPackagePath(packageId);
                 
-                // Apply filter only for primary packages (not dependencies)
-                if (!isDependency && !string.IsNullOrEmpty(filterPattern))
+                // Apply filter only for primary packages (not dependencies) and only if not already filtered
+                if (!isDependency && !skipFilterCheck && filterPatterns.Count > 0)
                 {
-                    if (string.IsNullOrEmpty(fullPath) || !fullPath.Contains(filterPattern, StringComparison.OrdinalIgnoreCase))
+                    bool matchesAnyFilter = filterPatterns.Any(filter => 
+                        !string.IsNullOrEmpty(fullPath) && fullPath.Contains(filter, StringComparison.OrdinalIgnoreCase));
+                    if (!matchesAnyFilter)
                     {
                         return imports; // Don't count as skipped, just not matching filter
                     }
@@ -3315,6 +3354,281 @@ public class Program
     }
     
     #endregion
+    
+    /// <summary>
+    /// Dump raw Zen package data from game IoStore for comparison
+    /// </summary>
+    private static int CliDumpZenFromGame(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool dump_zen_from_game <paks_path> <package_path> [output_file]");
+            Console.Error.WriteLine("Example: UAssetTool dump_zen_from_game \"E:\\Game\\Paks\" \"/Game/Marvel/Characters/1057/1057001/Meshes/SK_1057_1057001\" original.bin");
+            return 1;
+        }
+
+        string paksPath = args[1];
+        string packagePath = args[2];
+        string? outputFile = args.Length > 3 ? args[3] : null;
+
+        if (!Directory.Exists(paksPath))
+        {
+            Console.Error.WriteLine($"Paks directory not found: {paksPath}");
+            return 1;
+        }
+
+        try
+        {
+            // Find all .utoc files
+            var utocFiles = Directory.GetFiles(paksPath, "*.utoc", SearchOption.TopDirectoryOnly)
+                .OrderBy(f => f)
+                .ToList();
+
+            Console.WriteLine($"Searching {utocFiles.Count} containers for package: {packagePath}");
+
+            // Calculate package ID
+            var packageId = IoStore.FPackageId.FromName(packagePath);
+            Console.WriteLine($"Package ID: 0x{packageId.Value:X16}");
+
+            // Parse AES key for Marvel Rivals
+            byte[] aesKey = Convert.FromHexString("0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74");
+
+            foreach (var utocFile in utocFiles)
+            {
+                try
+                {
+                    using var reader = new IoStore.IoStoreReader(utocFile, aesKey);
+                    
+                    // Look for ExportBundleData chunk for this package
+                    var chunkId = IoStore.FIoChunkId.FromPackageId(packageId, 0, IoStore.EIoChunkType.ExportBundleData);
+                    
+                    if (reader.HasChunk(chunkId))
+                    {
+                        Console.WriteLine($"Found in: {Path.GetFileName(utocFile)}");
+                        
+                        byte[] zenData = reader.ReadChunk(chunkId);
+                        Console.WriteLine($"Zen package size: {zenData.Length} bytes");
+                        
+                        // Dump header info
+                        Console.WriteLine("\n=== Zen Package Header (first 256 bytes) ===");
+                        DumpHex(zenData, 0, Math.Min(256, zenData.Length));
+                        
+                        // Also check for BulkData chunk
+                        var bulkChunkId = IoStore.FIoChunkId.FromPackageId(packageId, 0, IoStore.EIoChunkType.BulkData);
+                        if (reader.HasChunk(bulkChunkId))
+                        {
+                            byte[] bulkData = reader.ReadChunk(bulkChunkId);
+                            Console.WriteLine($"\nBulkData chunk 0: {bulkData.Length} bytes");
+                        }
+                        
+                        // Check for additional BulkData chunks
+                        for (int i = 1; i < 10; i++)
+                        {
+                            var bulkChunkIdN = IoStore.FIoChunkId.FromPackageId(packageId, (ushort)i, IoStore.EIoChunkType.BulkData);
+                            if (reader.HasChunk(bulkChunkIdN))
+                            {
+                                byte[] bulkData = reader.ReadChunk(bulkChunkIdN);
+                                Console.WriteLine($"BulkData chunk {i}: {bulkData.Length} bytes");
+                            }
+                        }
+                        
+                        // Save to file if requested
+                        if (!string.IsNullOrEmpty(outputFile))
+                        {
+                            File.WriteAllBytes(outputFile, zenData);
+                            Console.WriteLine($"\nSaved to: {outputFile}");
+                        }
+                        
+                        return 0;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"  Warning: Error reading {Path.GetFileName(utocFile)}: {ex.Message}");
+                }
+            }
+
+            Console.Error.WriteLine($"Package not found: {packagePath}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return 1;
+        }
+    }
+    
+    private static void DumpHex(byte[] data, int offset, int length)
+    {
+        for (int i = 0; i < length; i += 16)
+        {
+            Console.Write($"{offset + i:X8}: ");
+            
+            // Hex bytes
+            for (int j = 0; j < 16; j++)
+            {
+                if (i + j < length)
+                    Console.Write($"{data[offset + i + j]:X2} ");
+                else
+                    Console.Write("   ");
+            }
+            
+            Console.Write(" ");
+            
+            // ASCII
+            for (int j = 0; j < 16 && i + j < length; j++)
+            {
+                byte b = data[offset + i + j];
+                Console.Write(b >= 32 && b < 127 ? (char)b : '.');
+            }
+            
+            Console.WriteLine();
+        }
+    }
+    
+    private static int CliExtractPak(string[] args)
+    {
+        // Usage: extract_pak <pak_path> <output_dir> [--aes <key>] [--filter <patterns...>]
+        if (args.Length < 3)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool extract_pak <pak_path> <output_dir> [options]");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Options:");
+            Console.Error.WriteLine("  --aes <key>          AES decryption key (hex string, 64 chars)");
+            Console.Error.WriteLine("  --filter <patterns>  Only extract files matching patterns (space-separated)");
+            Console.Error.WriteLine("  --list               List files only, don't extract");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Examples:");
+            Console.Error.WriteLine("  extract_pak mod.pak output --filter SK_1036 MI_Body");
+            Console.Error.WriteLine("  extract_pak mod.pak output --filter Meshes Textures Materials");
+            Console.Error.WriteLine("  extract_pak mod.pak output --list");
+            return 1;
+        }
+
+        string pakPath = args[1];
+        string outputDir = args[2];
+        string? aesKey = null;
+        List<string> filters = new();
+        bool listOnly = false;
+
+        // Parse options
+        for (int i = 3; i < args.Length; i++)
+        {
+            if (args[i] == "--aes" && i + 1 < args.Length)
+            {
+                aesKey = args[++i];
+            }
+            else if (args[i] == "--filter")
+            {
+                // Collect all following args until next option (starts with --)
+                while (i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+                {
+                    filters.Add(args[++i]);
+                }
+            }
+            else if (args[i] == "--list")
+            {
+                listOnly = true;
+            }
+        }
+
+        if (!File.Exists(pakPath))
+        {
+            Console.Error.WriteLine($"PAK file not found: {pakPath}");
+            return 1;
+        }
+
+        try
+        {
+            Console.Error.WriteLine($"[ExtractPak] Opening PAK: {pakPath}");
+            
+            using var pakReader = new IoStore.PakReader(pakPath, aesKey);
+            
+            Console.Error.WriteLine($"[ExtractPak] PAK Version: {pakReader.Version}");
+            Console.Error.WriteLine($"[ExtractPak] Mount Point: {pakReader.MountPoint}");
+            Console.Error.WriteLine($"[ExtractPak] Encrypted Index: {pakReader.EncryptedIndex}");
+            Console.Error.WriteLine($"[ExtractPak] Total Files: {pakReader.Files.Count}");
+            
+            var filesToExtract = pakReader.Files.ToList();
+            
+            // Apply filters if specified (file must match ANY of the filters)
+            if (filters.Count > 0)
+            {
+                filesToExtract = filesToExtract.Where(f => 
+                    filters.Any(filter => f.Contains(filter, StringComparison.OrdinalIgnoreCase))).ToList();
+                Console.Error.WriteLine($"[ExtractPak] Files matching filters [{string.Join(", ", filters)}]: {filesToExtract.Count}");
+            }
+            
+            if (listOnly)
+            {
+                Console.WriteLine($"Files in PAK ({filesToExtract.Count}):");
+                foreach (var file in filesToExtract)
+                {
+                    var entry = pakReader.GetEntry(file);
+                    Console.WriteLine($"  {file}");
+                    if (entry != null)
+                    {
+                        Console.WriteLine($"    Size: {entry.UncompressedSize} bytes, Compressed: {entry.CompressedSize} bytes");
+                    }
+                }
+                return 0;
+            }
+            
+            // Create output directory
+            Directory.CreateDirectory(outputDir);
+            
+            int extracted = 0;
+            int failed = 0;
+            
+            foreach (var file in filesToExtract)
+            {
+                try
+                {
+                    byte[] data = pakReader.Get(file);
+                    
+                    // Determine output path
+                    string relativePath = file;
+                    if (relativePath.StartsWith("../"))
+                    {
+                        // Remove leading ../../../ etc
+                        while (relativePath.StartsWith("../"))
+                            relativePath = relativePath.Substring(3);
+                    }
+                    
+                    string outputPath = Path.Combine(outputDir, relativePath);
+                    string? outputDirPath = Path.GetDirectoryName(outputPath);
+                    if (!string.IsNullOrEmpty(outputDirPath))
+                        Directory.CreateDirectory(outputDirPath);
+                    
+                    File.WriteAllBytes(outputPath, data);
+                    extracted++;
+                    
+                    if (extracted % 10 == 0 || extracted == filesToExtract.Count)
+                    {
+                        Console.Error.WriteLine($"[ExtractPak] Extracted {extracted}/{filesToExtract.Count} files...");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ExtractPak] Failed to extract '{file}': {ex.Message}");
+                    failed++;
+                }
+            }
+            
+            Console.WriteLine($"Extraction complete: {extracted} extracted, {failed} failed");
+            Console.WriteLine($"Output directory: {outputDir}");
+            return failed > 0 ? 1 : 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+            {
+                Console.Error.WriteLine(ex.StackTrace);
+            }
+            return 1;
+        }
+    }
 }
 
 #region Request/Response Models

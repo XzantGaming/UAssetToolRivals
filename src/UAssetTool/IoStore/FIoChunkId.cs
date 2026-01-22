@@ -114,8 +114,8 @@ public struct FPackageId
 
     public static FPackageId FromName(string packageName)
     {
-        // CityHash64 of lowercase package name
-        return new FPackageId(CityHash.CityHash64(packageName.ToLowerInvariant()));
+        // CityHash64 of lowercase package name using ASCII-only ToLower (matching CUE4Parse)
+        return new FPackageId(CityHash.CityHash64WithAsciiLower(packageName));
     }
 
     public override string ToString() => $"FPackageId({Value:X16})";
@@ -138,6 +138,26 @@ public static class CityHash
         // Rust uses: s.to_ascii_lowercase().encode_utf16().flat_map(|c| c.to_le_bytes())
         // This is UTF-16LE encoding of lowercase string
         byte[] bytes = System.Text.Encoding.Unicode.GetBytes(s.ToLowerInvariant());
+        return CityHash64(bytes, 0, bytes.Length);
+    }
+
+    /// <summary>
+    /// CityHash64 with ASCII-only ToLower and UTF-16LE encoding (matching CUE4Parse FPackageId.FromName).
+    /// </summary>
+    public static ulong CityHash64WithAsciiLower(string s)
+    {
+        // CUE4Parse uses ASCII-only ToLower: only A-Z -> a-z, everything else unchanged
+        char[] result = new char[s.Length];
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            // Only lowercase A-Z (ASCII 65-90) to a-z (ASCII 97-122)
+            if (c >= 'A' && c <= 'Z')
+                result[i] = (char)(c + 32);
+            else
+                result[i] = c;
+        }
+        byte[] bytes = System.Text.Encoding.Unicode.GetBytes(result);
         return CityHash64(bytes, 0, bytes.Length);
     }
 

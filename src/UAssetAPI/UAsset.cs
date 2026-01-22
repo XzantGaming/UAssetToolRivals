@@ -3207,10 +3207,8 @@ namespace UAssetAPI
             }
             
             // Initialize other fields
-            if (PackageGuid == Guid.Empty)
-            {
-                PackageGuid = Guid.NewGuid();
-            }
+            // Note: PackageGuid should remain Guid.Empty for cooked assets
+            // The game expects all zeros, not a random GUID
         }
 
         /// <summary>

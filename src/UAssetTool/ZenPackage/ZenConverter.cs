@@ -109,21 +109,33 @@ public class ZenConverter
         var asset = LoadAsset(uassetPath, usmapPath);
         asset.UseSeparateBulkDataFiles = true;
 
+        // Log whether asset uses versioned or unversioned properties
+        // The Zen package flags will be set to match the source asset's format
+        Console.Error.WriteLine($"[ZenConverter] Asset HasUnversionedProperties: {asset.HasUnversionedProperties}");
+
         // Extract package path from asset's FolderName
         // FolderName contains the directory path like "/Game/Marvel/Characters/1033/1033001/Weapons/Meshes/Stick_L"
         string folderName = asset.FolderName?.Value ?? "";
         string assetName = Path.GetFileNameWithoutExtension(uassetPath);
         
         // Build the full package path
-        // FolderName is like "/Game/Marvel/Characters/..." - we need to convert to "Marvel/Content/Marvel/Characters/..."
-        if (folderName.StartsWith("/Game/"))
+        // FolderName may contain /../../../ segments that need to be normalized
+        // Example: /Game/Marvel/../../../Marvel/Content/Marvel/Characters/... -> Marvel/Content/Marvel/Characters/...
+        string normalizedFolder = NormalizePath(folderName);
+        
+        if (normalizedFolder.StartsWith("/Game/"))
         {
             // Convert /Game/X to Marvel/Content/X
-            packagePath = "Marvel/Content" + folderName.Substring(5); // Remove "/Game" prefix
+            packagePath = "Marvel/Content" + normalizedFolder.Substring(5); // Remove "/Game" prefix
         }
-        else if (!string.IsNullOrEmpty(folderName))
+        else if (normalizedFolder.StartsWith("/Marvel/Content/"))
         {
-            packagePath = folderName.TrimStart('/');
+            // Already in correct format, just remove leading slash
+            packagePath = normalizedFolder.TrimStart('/');
+        }
+        else if (!string.IsNullOrEmpty(normalizedFolder))
+        {
+            packagePath = normalizedFolder.TrimStart('/');
         }
         else
         {
@@ -171,8 +183,39 @@ public class ZenConverter
         // Build import map with proper remapping
         BuildImportMap(asset, zenPackage);
 
+        // Check if this is a SkeletalMesh or StaticMesh that needs material slot padding
+        // We need to calculate padding BEFORE building export map so sizes are correct
+        bool isSkeletalMesh = asset.Exports.Any(e => 
+            e.GetExportClassType()?.Value?.Value == "SkeletalMesh" ||
+            e.GetExportClassType()?.Value?.Value?.Contains("SkeletalMesh") == true);
+        
+        bool isStaticMesh = asset.Exports.Any(e => 
+            e.GetExportClassType()?.Value?.Value == "StaticMesh");
+        
+        int materialPaddingToAdd = 0;
+        if (isSkeletalMesh)
+        {
+            // Calculate how much padding will be added (without actually patching yet)
+            materialPaddingToAdd = CalculateSkeletalMeshMaterialPadding(uexpData);
+            if (materialPaddingToAdd > 0)
+            {
+                Console.Error.WriteLine($"[ZenConverter] SkeletalMesh will need {materialPaddingToAdd} bytes of material padding");
+            }
+        }
+        else if (isStaticMesh)
+        {
+            // DISABLED: StaticMesh padding - testing without it first
+            // materialPaddingToAdd = CalculateStaticMeshMaterialPadding(uexpData);
+            // if (materialPaddingToAdd > 0)
+            // {
+            //     Console.Error.WriteLine($"[ZenConverter] StaticMesh will need {materialPaddingToAdd} bytes of material padding");
+            // }
+            Console.Error.WriteLine($"[ZenConverter] StaticMesh detected - padding disabled for testing");
+        }
+
         // Build export map with RECALCULATED SerialSize from actual data
-        BuildExportMapWithRecalculatedSizes(asset, zenPackage, uexpData, headerSize);
+        // Pass the padding amount so the last export's size is correct
+        BuildExportMapWithRecalculatedSizes(asset, zenPackage, uexpData, headerSize, materialPaddingToAdd);
 
         // Build export bundles (required for UE5 to load assets)
         BuildExportBundles(asset, zenPackage);
@@ -201,51 +244,54 @@ public class ZenConverter
         UAsset asset,
         FZenPackage zenPackage,
         byte[] uexpData,
-        long headerSize)
+        long headerSize,
+        int materialPaddingToAdd = 0)
     {
-        var sortedExports = asset.Exports.OrderBy(e => e.SerialOffset).ToList();
+        // Calculate sizes based on sorted offsets
+        var sortedByOffset = asset.Exports.OrderBy(e => e.SerialOffset).ToList();
         
-        // Build a mapping from export to its index for remapping
-        var exportToIndex = new Dictionary<Export, int>();
-        for (int i = 0; i < asset.Exports.Count; i++)
+        // Build a mapping from export to its size (calculated from offset gaps)
+        var exportSizes = new Dictionary<Export, long>();
+        for (int i = 0; i < sortedByOffset.Count; i++)
         {
-            exportToIndex[asset.Exports[i]] = i;
+            var export = sortedByOffset[i];
+            long startInUexp = export.SerialOffset - headerSize;
+            long endInUexp = (i < sortedByOffset.Count - 1)
+                ? sortedByOffset[i + 1].SerialOffset - headerSize
+                : uexpData.Length - 4; // Exclude PACKAGE_FILE_TAG
+            exportSizes[export] = endInUexp - startInUexp;
         }
+        
+        // Keep original export order - reordering corrupts the data
+        // The asset type icon in FModel is cosmetic, data integrity is critical
+        var exportsToProcess = asset.Exports.ToList();
 
-        // Check for .ubulk file - bulk data size must be added to the last export's CookedSerialSize
-        // Even though bulk data is in a separate IoStore chunk, the game expects the export size
-        // to include the bulk data reference structure
+        // Note: .ubulk bulk data is stored in a SEPARATE IoStore chunk, NOT added to export size
+        // The CookedSerialSize should only include the .uexp data, not bulk data
         string ubulkPath = Path.ChangeExtension(asset.FilePath, ".ubulk");
-        long bulkDataAdjustment = 0;
         if (File.Exists(ubulkPath))
         {
             long ubulkSize = new FileInfo(ubulkPath).Length;
-            const long BULK_DATA_OVERHEAD = 432; // Overhead for bulk data reference structure
-            bulkDataAdjustment = ubulkSize + BULK_DATA_OVERHEAD;
-            Console.Error.WriteLine($"[ZenConverter] Found .ubulk ({ubulkSize} bytes), will add {bulkDataAdjustment} to last export");
+            Console.Error.WriteLine($"[ZenConverter] Found .ubulk ({ubulkSize} bytes) - will be written as separate BulkData chunk");
         }
 
         // Get package name for public export hash calculation
         string packageName = Path.GetFileNameWithoutExtension(asset.FilePath);
 
-        for (int i = 0; i < sortedExports.Count; i++)
+        // Process exports in reordered list (main asset last)
+        for (int i = 0; i < exportsToProcess.Count; i++)
         {
-            var export = sortedExports[i];
-            int originalIndex = exportToIndex[export];
+            var export = exportsToProcess[i];
             
-            // Calculate ACTUAL size from export data, not from header
-            long startInUexp = export.SerialOffset - headerSize;
-            long endInUexp = (i < sortedExports.Count - 1)
-                ? sortedExports[i + 1].SerialOffset - headerSize
-                : uexpData.Length - 4; // Exclude PACKAGE_FILE_TAG
-
-            long actualSize = endInUexp - startInUexp;
-
-            // Add bulk data adjustment for last export if .ubulk exists
-            if (i == sortedExports.Count - 1 && bulkDataAdjustment > 0)
+            // Get pre-calculated size from offset gaps
+            long actualSize = exportSizes[export];
+            
+            // Add material padding to the SkeletalMesh or StaticMesh export
+            string exportClassName = export.GetExportClassType()?.Value?.Value ?? "";
+            if (materialPaddingToAdd > 0 && (exportClassName == "SkeletalMesh" || exportClassName.Contains("SkeletalMesh") || exportClassName == "StaticMesh"))
             {
-                actualSize += bulkDataAdjustment;
-                Console.Error.WriteLine($"[ZenConverter] Export {i} ({export.ObjectName?.Value?.Value}): Added bulk data adjustment {bulkDataAdjustment}, size={actualSize}");
+                actualSize += materialPaddingToAdd;
+                Console.Error.WriteLine($"[ZenConverter] Export {i} ({export.ObjectName?.Value?.Value}): size={actualSize} (includes {materialPaddingToAdd} bytes material padding)");
             }
             else
             {
@@ -258,6 +304,12 @@ public class ZenConverter
             var classIndex = RemapLegacyPackageIndex(export.ClassIndex, zenPackage);
             var superIndex = RemapLegacyPackageIndex(export.SuperIndex, zenPackage);
             var templateIndex = RemapLegacyPackageIndex(export.TemplateIndex, zenPackage);
+            
+            // Debug: show remapped indices for first few exports
+            if (i < 3)
+            {
+                Console.Error.WriteLine($"[ZenConverter] Export {i} indices: Outer={export.OuterIndex.Index}->0x{outerIndex.Value:X16}, Class={export.ClassIndex.Index}->0x{classIndex.Value:X16}, Super={export.SuperIndex.Index}->0x{superIndex.Value:X16}, Template={export.TemplateIndex.Index}->0x{templateIndex.Value:X16}");
+            }
 
             // Calculate public export hash for public exports
             // RF_Public = 0x00000001
@@ -267,6 +319,7 @@ public class ZenConverter
             {
                 string exportName = export.ObjectName?.Value?.Value ?? "None";
                 publicExportHash = CalculatePublicExportHash(exportName);
+                Console.Error.WriteLine($"[ZenConverter] Export {i} ({exportName}): PublicExportHash=0x{publicExportHash:X16}, IsPublic={isPublic}");
             }
 
             // Determine filter flags (these properties may not exist on all exports)
@@ -275,11 +328,12 @@ public class ZenConverter
             // Create Zen export entry with ACTUAL calculated size
             // CookedSerialOffset is relative to CookedHeaderSize (which equals HeaderSize in Zen packages)
             // We store the offset relative to the start of export data (after header)
+            long exportOffset = export.SerialOffset - headerSize;
             var zenExport = new FExportMapEntry
             {
-                CookedSerialOffset = (ulong)startInUexp,
+                CookedSerialOffset = (ulong)exportOffset,
                 CookedSerialSize = (ulong)actualSize,
-                ObjectName = MapNameToZen(zenPackage, export.ObjectName?.Value?.Value),
+                ObjectName = MapNameToZen(zenPackage, export.ObjectName?.Value?.Value, export.ObjectName?.Number ?? 0),
                 ObjectFlags = (uint)export.ObjectFlags,
                 FilterFlags = filterFlags,
                 OuterIndex = outerIndex,
@@ -315,14 +369,18 @@ public class ZenConverter
         
         if (legacyIndex.IsImport())
         {
-            // Look up the import in the import map (which was already built with correct types)
+            // For imports, we need to return the FPackageObjectIndex that's stored in the import map
+            // The import map already contains the correct FPackageObjectIndex values (script hashes or package imports)
             int importIndex = -legacyIndex.Index - 1;
             if (importIndex >= 0 && importIndex < zenPackage.ImportMap.Count)
             {
+                // Return the FPackageObjectIndex stored in the import map
+                // This is either a script object hash or a package import reference
                 return zenPackage.ImportMap[importIndex];
             }
-            // Fallback to package import if import map not available
-            return FPackageObjectIndex.CreateImport((uint)importIndex);
+            // Fallback - should not happen if import map is built correctly
+            Console.Error.WriteLine($"[RemapLegacyPackageIndex] Warning: Import index {importIndex} out of range (map has {zenPackage.ImportMap.Count} entries)");
+            return FPackageObjectIndex.CreateNull();
         }
         
         return FPackageObjectIndex.CreateNull();
@@ -380,6 +438,57 @@ public class ZenConverter
         return GetPublicExportHash(exportName);
     }
 
+    /// <summary>
+    /// Find the index of the main asset export (SkeletalMesh, StaticMesh, Texture2D, etc.)
+    /// Returns -1 if not found or already at index 0
+    /// </summary>
+    private static int FindMainAssetExportIndex(UAsset asset)
+    {
+        // Main asset types that should be at index 0
+        var mainAssetTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "SkeletalMesh",
+            "StaticMesh",
+            "Texture2D",
+            "Material",
+            "MaterialInstance",
+            "MaterialInstanceConstant",
+            "AnimSequence",
+            "AnimMontage",
+            "Blueprint",
+            "WidgetBlueprint",
+            "SoundWave",
+            "SoundCue",
+            "ParticleSystem",
+            "NiagaraSystem",
+            "PhysicsAsset",
+            "Skeleton"
+        };
+        
+        for (int i = 0; i < asset.Exports.Count; i++)
+        {
+            var export = asset.Exports[i];
+            
+            // Get the class name from ClassIndex
+            string? className = null;
+            if (export.ClassIndex.IsImport())
+            {
+                int importIdx = -export.ClassIndex.Index - 1;
+                if (importIdx >= 0 && importIdx < asset.Imports.Count)
+                {
+                    className = asset.Imports[importIdx].ObjectName?.Value?.Value;
+                }
+            }
+            
+            if (className != null && mainAssetTypes.Contains(className))
+            {
+                return i;
+            }
+        }
+        
+        return -1; // Not found
+    }
+
     private static void BuildNameMap(UAsset asset, FZenPackage zenPackage)
     {
         // Add all names from legacy name map
@@ -391,18 +500,26 @@ public class ZenConverter
         
         // Get the package name from the asset
         // The package name should be the FULL path like "/Game/Marvel/Characters/..." 
-        // which gets converted to "/Marvel/Content/Marvel/Characters/..." for the mod manager
         string folderName = asset.FolderName?.Value ?? "";
         string assetName = Path.GetFileNameWithoutExtension(asset.FilePath ?? "Unknown");
         
-        // Build the full package path that the mod manager expects
-        // FolderName is like "/Game/Marvel/Characters/.../AssetName" - it already includes the asset name
-        // So we just use FolderName directly as the package name
+        // Normalize the folder name to resolve /../../../ segments
+        string normalizedFolder = NormalizePath(folderName);
+        
+        // Build the package name in /Game/... format
         string packageName;
-        if (!string.IsNullOrEmpty(folderName))
+        if (normalizedFolder.StartsWith("/Game/"))
         {
-            // FolderName already contains the full path including asset name
-            packageName = folderName;
+            packageName = normalizedFolder;
+        }
+        else if (normalizedFolder.StartsWith("/Marvel/Content/"))
+        {
+            // Convert /Marvel/Content/X to /Game/X
+            packageName = "/Game" + normalizedFolder.Substring("/Marvel/Content".Length);
+        }
+        else if (!string.IsNullOrEmpty(normalizedFolder))
+        {
+            packageName = normalizedFolder;
         }
         else
         {
@@ -427,26 +544,27 @@ public class ZenConverter
     private static void SetPackageSummary(UAsset asset, FZenPackage zenPackage)
     {
         // Set package name index from the name map
+        // Name.Number must be 0 - using a non-zero number causes FModel/CUE4Parse to append 
+        // the number suffix to the package path when looking up store entries, breaking resolution
         zenPackage.Summary.Name = new FMappedName((uint)zenPackage.PackageNameIndex, 0);
         
         // Copy package flags from legacy asset
-        // PKG_Cooked (0x00000200) + PKG_FilterEditorOnly (0x80000000) + PKG_ContainsMap (0x00002000) etc.
-        // For cooked assets, we need at minimum PKG_Cooked
-        uint packageFlags = 0;
+        // PKG_Cooked (0x00000200) + PKG_FilterEditorOnly (0x80000000) + PKG_UnversionedProperties (0x00002000)
+        // The PKG_UnversionedProperties flag must match the actual serialization format of the source asset
+        uint packageFlags = 0x80000200; // PKG_FilterEditorOnly | PKG_Cooked (base flags)
         
-        // Get flags from the legacy asset if available
-        if (asset.PackageFlags != 0)
+        // Merge any additional flags from the legacy asset
+        packageFlags |= (uint)asset.PackageFlags;
+        
+        // Only set PKG_UnversionedProperties if the source asset uses unversioned serialization
+        if (asset.HasUnversionedProperties)
         {
-            packageFlags = (uint)asset.PackageFlags;
-        }
-        else
-        {
-            // Default flags for cooked UE5 assets
-            // PKG_Cooked = 0x00000200, PKG_FilterEditorOnly = 0x80000000
-            packageFlags = 0x80000200;
+            packageFlags |= 0x00002000; // PKG_UnversionedProperties
         }
         
         zenPackage.Summary.PackageFlags = packageFlags;
+        
+        Console.Error.WriteLine($"[ZenConverter] Source asset HasUnversionedProperties: {asset.HasUnversionedProperties}");
         
         // Set cooked header size from legacy asset
         zenPackage.Summary.CookedHeaderSize = (uint)asset.Exports.Min(e => e.SerialOffset);
@@ -472,17 +590,24 @@ public class ZenConverter
             if (objectPath.StartsWith("/Script/"))
             {
                 // Try to look up the pre-computed hash from the game's script objects database
+                // Use the FULL PATH for lookup to avoid ambiguity with objects that have the same name
                 FPackageObjectIndex scriptImport;
-                if (_scriptObjectsDb != null && _scriptObjectsDb.TryGetGlobalIndex(objectName, out ulong globalIndex))
+                if (_scriptObjectsDb != null && _scriptObjectsDb.TryGetGlobalIndexByPath(objectPath, out ulong globalIndex))
                 {
-                    // Use the pre-computed hash from the game
+                    // Use the pre-computed hash from the game (found by full path)
                     scriptImport = FPackageObjectIndex.CreateFromRaw(globalIndex);
+                }
+                else if (_scriptObjectsDb != null && _scriptObjectsDb.TryGetGlobalIndex(objectName, out globalIndex))
+                {
+                    // Fallback to simple name lookup
+                    scriptImport = FPackageObjectIndex.CreateFromRaw(globalIndex);
+                    Console.Error.WriteLine($"[BuildImportMap] Warning: Script object '{objectPath}' not found by path, using simple name '{objectName}' -> 0x{globalIndex:X16}");
                 }
                 else
                 {
                     // Fallback to generating hash from path
                     scriptImport = FPackageObjectIndex.CreateScriptImport(objectPath);
-                    Console.Error.WriteLine($"[BuildImportMap] Warning: Script object '{objectName}' not found in database, using generated hash");
+                    Console.Error.WriteLine($"[BuildImportMap] Warning: Script object '{objectPath}' not found in database, using generated hash");
                 }
                 zenPackage.ImportMap.Add(scriptImport);
             }
@@ -544,7 +669,7 @@ public class ZenConverter
         }
     }
 
-    private static FMappedName MapNameToZen(FZenPackage zenPackage, string? name)
+    private static FMappedName MapNameToZen(FZenPackage zenPackage, string? name, int number = 0)
     {
         string nameStr = name ?? "None";
         int index = zenPackage.NameMap.IndexOf(nameStr);
@@ -552,8 +677,9 @@ public class ZenConverter
         {
             index = zenPackage.NameMap.Count;
             zenPackage.NameMap.Add(nameStr);
+            Console.Error.WriteLine($"[ZenConverter] Added new name to NameMap: '{nameStr}' at index {index}");
         }
-        return new FMappedName((uint)index, 0);
+        return new FMappedName((uint)index, (uint)number);
     }
     
     /// <summary>
@@ -571,7 +697,16 @@ public class ZenConverter
             current = asset.Imports[outerIdx];
         }
         // The root import's ObjectName is the package path
-        return current.ObjectName?.Value?.Value ?? "";
+        // FName Number produces _1, _2, etc. but game files use _01, _02 format
+        // Convert FName number to game's format with leading zero
+        string basePath = current.ObjectName?.Value?.Value ?? "";
+        int number = current.ObjectName?.Number ?? 0;
+        if (number > 0)
+        {
+            // Number=2 means suffix _1 in FName, but game uses _01
+            return basePath + "_" + (number - 1).ToString("D2");
+        }
+        return basePath;
     }
     
     /// <summary>
@@ -585,7 +720,17 @@ public class ZenConverter
         
         while (current.OuterIndex.Index != 0)
         {
-            parts.Add(current.ObjectName?.Value?.Value ?? "");
+            // Convert FName number to game's _01, _02 format
+            string baseName = current.ObjectName?.Value?.Value ?? "";
+            int number = current.ObjectName?.Number ?? 0;
+            if (number > 0)
+            {
+                parts.Add(baseName + "_" + (number - 1).ToString("D2"));
+            }
+            else
+            {
+                parts.Add(baseName);
+            }
             int outerIdx = -current.OuterIndex.Index - 1;
             if (outerIdx < 0 || outerIdx >= asset.Imports.Count)
                 break;
@@ -683,15 +828,115 @@ public class ZenConverter
             if (c > 127) return false;
         return true;
     }
+    
+    /// <summary>
+    /// Normalize a path by resolving .. segments
+    /// Example: /Game/Marvel/../../../Marvel/Content/Marvel/Characters -> /Marvel/Content/Marvel/Characters
+    /// </summary>
+    private static string NormalizePath(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !path.Contains(".."))
+            return path;
+        
+        var parts = path.Split('/');
+        var stack = new List<string>();
+        
+        foreach (var part in parts)
+        {
+            if (part == "..")
+            {
+                if (stack.Count > 0)
+                    stack.RemoveAt(stack.Count - 1);
+            }
+            else if (!string.IsNullOrEmpty(part) && part != ".")
+            {
+                stack.Add(part);
+            }
+        }
+        
+        string result = string.Join("/", stack);
+        if (path.StartsWith("/"))
+            result = "/" + result;
+        return result;
+    }
 
     /// <summary>
     /// Build export bundles - groups of exports that are loaded together
     /// For UE5.3+ (NoExportInfo), all exports go into a single bundle
+    /// The order of entries is determined by export dependencies (topological sort)
     /// </summary>
     private static void BuildExportBundles(UAsset asset, FZenPackage zenPackage)
     {
         // For UE5.3+ NoExportInfo version, we create a single export bundle containing all exports
         // Each export gets two entries: Create and Serialize
+        // The order must respect dependencies - exports that depend on others must come after
+        
+        // Build dependency map from export dependencies
+        var depsMap = new Dictionary<int, IList<int>>();
+        for (int i = 0; i < asset.Exports.Count; i++)
+        {
+            var export = asset.Exports[i];
+            var deps = new List<int>();
+            
+            // Add dependencies from SerializationBeforeSerializationDependencies
+            if (export.SerializationBeforeSerializationDependencies != null)
+            {
+                foreach (var dep in export.SerializationBeforeSerializationDependencies)
+                {
+                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
+                    {
+                        deps.Add(dep.Index - 1); // Convert to 0-based
+                    }
+                }
+            }
+            
+            // Add dependencies from CreateBeforeSerializationDependencies
+            if (export.CreateBeforeSerializationDependencies != null)
+            {
+                foreach (var dep in export.CreateBeforeSerializationDependencies)
+                {
+                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
+                    {
+                        deps.Add(dep.Index - 1);
+                    }
+                }
+            }
+            
+            // Add dependencies from SerializationBeforeCreateDependencies
+            if (export.SerializationBeforeCreateDependencies != null)
+            {
+                foreach (var dep in export.SerializationBeforeCreateDependencies)
+                {
+                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
+                    {
+                        deps.Add(dep.Index - 1);
+                    }
+                }
+            }
+            
+            // Add dependencies from CreateBeforeCreateDependencies
+            if (export.CreateBeforeCreateDependencies != null)
+            {
+                foreach (var dep in export.CreateBeforeCreateDependencies)
+                {
+                    if (dep.IsExport() && dep.Index > 0 && dep.Index <= asset.Exports.Count)
+                    {
+                        deps.Add(dep.Index - 1);
+                    }
+                }
+            }
+            
+            // Add OuterIndex as dependency (outer must be created before inner)
+            if (export.OuterIndex.Index > 0)
+            {
+                deps.Add(export.OuterIndex.Index - 1);
+            }
+            
+            depsMap[i] = deps.Distinct().ToList();
+        }
+        
+        // Topological sort to get load order
+        var sortedOrder = TopologicalSort(Enumerable.Range(0, asset.Exports.Count), depsMap);
         
         // Create a single bundle header
         var bundleHeader = new FExportBundleHeader
@@ -702,18 +947,52 @@ public class ZenConverter
         };
         zenPackage.ExportBundleHeaders.Add(bundleHeader);
         
-        // Add Create entries for all exports first, then Serialize entries
-        for (int i = 0; i < zenPackage.ExportMap.Count; i++)
+        // Add Create entries in dependency order, then Serialize entries in same order
+        foreach (int i in sortedOrder)
         {
             zenPackage.ExportBundleEntries.Add(new FExportBundleEntry((uint)i, EExportCommandType.Create));
         }
         
-        for (int i = 0; i < zenPackage.ExportMap.Count; i++)
+        foreach (int i in sortedOrder)
         {
             zenPackage.ExportBundleEntries.Add(new FExportBundleEntry((uint)i, EExportCommandType.Serialize));
         }
         
-        Console.Error.WriteLine($"[ZenConverter] Created {zenPackage.ExportBundleHeaders.Count} export bundle(s) with {zenPackage.ExportBundleEntries.Count} entries");
+        Console.Error.WriteLine($"[ZenConverter] Created {zenPackage.ExportBundleHeaders.Count} export bundle(s) with {zenPackage.ExportBundleEntries.Count} entries (sorted by dependencies)");
+    }
+    
+    /// <summary>
+    /// Topological sort - returns items in dependency order (dependencies first)
+    /// </summary>
+    private static List<int> TopologicalSort(IEnumerable<int> items, Dictionary<int, IList<int>> dependencies)
+    {
+        var sorted = new List<int>();
+        var visited = new HashSet<int>();
+        
+        foreach (var item in items)
+        {
+            TopologicalSortVisit(item, visited, sorted, dependencies);
+        }
+        
+        return sorted;
+    }
+    
+    private static void TopologicalSortVisit(int item, HashSet<int> visited, List<int> sorted, Dictionary<int, IList<int>> dependencies)
+    {
+        if (visited.Contains(item))
+            return;
+            
+        visited.Add(item);
+        
+        if (dependencies.TryGetValue(item, out var deps))
+        {
+            foreach (var dep in deps)
+            {
+                TopologicalSortVisit(dep, visited, sorted, dependencies);
+            }
+        }
+        
+        sorted.Add(item);
     }
 
     /// <summary>
@@ -840,8 +1119,64 @@ public class ZenConverter
         // Write bulk data map entries from legacy asset's DataResources
         // UE5.3+ expects this field after the name map for packages with DataResources support
         // Each FBulkDataMapEntry is 32 bytes: serial_offset(8) + duplicate_serial_offset(8) + serial_size(8) + flags(4) + pad(4)
-        if (asset.DataResources != null && asset.DataResources.Count > 0)
+        // 
+        // IMPORTANT: If we have a .ubulk file, we need to validate/fix the offsets to match the actual file
+        long ubulkSize = 0;
+        string ubulkPath = Path.ChangeExtension(asset.FilePath, ".ubulk");
+        if (File.Exists(ubulkPath))
         {
+            ubulkSize = new FileInfo(ubulkPath).Length;
+        }
+        
+        if (asset.DataResources != null && asset.DataResources.Count > 0 && ubulkSize > 0)
+        {
+            // Validate that bulk data map entries fit within the .ubulk file
+            // If they don't, create a single entry covering the entire .ubulk
+            bool entriesValid = true;
+            foreach (var resource in asset.DataResources)
+            {
+                if (resource.SerialOffset + resource.SerialSize > ubulkSize)
+                {
+                    entriesValid = false;
+                    break;
+                }
+            }
+            
+            if (entriesValid)
+            {
+                // Use existing entries
+                long bulkDataMapSize = asset.DataResources.Count * 32;
+                writer.Write(bulkDataMapSize);
+                
+                Console.Error.WriteLine($"[ZenConverter] Writing {asset.DataResources.Count} bulk data map entries ({bulkDataMapSize} bytes):");
+                int idx = 0;
+                foreach (var resource in asset.DataResources)
+                {
+                    Console.Error.WriteLine($"  [{idx}] SerialOffset={resource.SerialOffset}, DupOffset={resource.DuplicateSerialOffset}, Size={resource.SerialSize}, RawSize={resource.RawSize}, Flags=0x{resource.LegacyBulkDataFlags:X8}, OuterIndex={resource.OuterIndex}");
+                    writer.Write(resource.SerialOffset);
+                    writer.Write(resource.DuplicateSerialOffset);
+                    writer.Write(resource.SerialSize);
+                    writer.Write((uint)resource.LegacyBulkDataFlags);
+                    writer.Write((uint)0); // padding
+                    idx++;
+                }
+            }
+            else
+            {
+                // Entries don't match .ubulk size - create single entry for entire file
+                Console.Error.WriteLine($"[ZenConverter] Bulk data map entries invalid for .ubulk size {ubulkSize}, creating single entry");
+                writer.Write((long)32); // 1 entry * 32 bytes
+                writer.Write((long)0); // SerialOffset = 0
+                writer.Write((long)-1); // DuplicateSerialOffset = -1 (none)
+                writer.Write(ubulkSize); // SerialSize = entire file
+                writer.Write((uint)0x00010501); // Flags: PayloadAtEndOfFile | PayloadInSeperateFile | SingleUse
+                writer.Write((uint)0); // padding
+                Console.Error.WriteLine($"  [0] SerialOffset=0, DupOffset=-1, Size={ubulkSize}, Flags=0x00010501");
+            }
+        }
+        else if (asset.DataResources != null && asset.DataResources.Count > 0)
+        {
+            // No .ubulk file but we have DataResources - write them as-is
             long bulkDataMapSize = asset.DataResources.Count * 32;
             writer.Write(bulkDataMapSize);
             
@@ -932,7 +1267,7 @@ public class ZenConverter
         // Record header size before writing export data
         int zenHeaderSize = (int)writer.BaseStream.Position;
 
-        // Write export data (excluding PACKAGE_FILE_TAG)
+        // Write export data - reorder if exports were reordered
         int exportDataLength = uexpData.Length;
         if (exportDataLength >= 4)
         {
@@ -942,12 +1277,118 @@ public class ZenConverter
                 exportDataLength -= 4;
             }
         }
-        writer.Write(uexpData, 0, exportDataLength);
+        
+        // Calculate preload size - the data before actual export serialization in .uexp
+        // The preload contains dependency info and is written before export data
+        // In Zen format: preload is between HeaderSize and CookedHeaderSize
+        // In legacy format: preload is at start of .uexp, before first export's actual data
+        
+        // Get PreloadDependencyCount - this tells us how many dependency entries exist
+        var preloadDepCountField = asset.GetType().GetField("PreloadDependencyCount", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        int preloadDependencyCount = preloadDepCountField != null ? (int)preloadDepCountField.GetValue(asset)! : 0;
+        
+        // Calculate preload size based on the structure written by ZenToLegacyConverter
+        // The preload data structure is:
+        // - For each export with dependencies: the dependency indices (4 bytes each)
+        // - Total size = sum of all dependency counts * 4
+        int preloadSize = 0;
+        if (preloadDependencyCount > 0)
+        {
+            // Preload size = dependency count * sizeof(int32)
+            // Plus some header bytes for the preload structure
+            // The exact format depends on how ZenToLegacyConverter wrote it
+            
+            // Calculate total dependencies from all exports
+            int totalDeps = 0;
+            foreach (var export in asset.Exports)
+            {
+                var sbs = export.GetType().GetField("SerializationBeforeSerializationDependenciesSize", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                var cbs = export.GetType().GetField("CreateBeforeSerializationDependenciesSize", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                var sbc = export.GetType().GetField("SerializationBeforeCreateDependenciesSize", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                var cbc = export.GetType().GetField("CreateBeforeCreateDependenciesSize", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                
+                if (sbs != null) totalDeps += (int)sbs.GetValue(export)!;
+                if (cbs != null) totalDeps += (int)cbs.GetValue(export)!;
+                if (sbc != null) totalDeps += (int)sbc.GetValue(export)!;
+                if (cbc != null) totalDeps += (int)cbc.GetValue(export)!;
+            }
+            
+            // Preload size = total dependency indices * 4 bytes each
+            preloadSize = totalDeps * 4;
+        }
+        
+        // Use PreloadDependencyCount directly if totalDeps didn't work
+        if (preloadSize == 0 && preloadDependencyCount > 0)
+        {
+            preloadSize = preloadDependencyCount * 4;
+        }
+        
+        // The preload data also includes a header with counts for each export
+        // Each export has 4 count fields (4 bytes each = 16 bytes per export with deps)
+        // Plus the actual dependency indices
+        if (preloadSize > 0)
+        {
+            // Add header bytes: typically includes per-export dependency counts
+            // The structure is: for each export, 4 int32 counts, then the indices
+            // But the indices are already counted, so we just need alignment
+            // Looking at original: 1333 bytes for 324 deps = 324*4 + 37 header
+            // The 37 bytes is likely: some header + padding
+            preloadSize += 37; // Match the original's header overhead
+        }
+        
+        // If we couldn't calculate from dependencies, try to detect from .uexp content
+        if (preloadSize == 0 && uexpData.Length > 4)
+        {
+            int firstInt = BitConverter.ToInt32(uexpData, 0);
+            // If first int is small (looks like a count), there's likely preload data
+            if (firstInt >= 0 && firstInt < 1000)
+            {
+                // Use preloadDependencyCount * 4 as estimate
+                preloadSize = preloadDependencyCount * 4;
+            }
+        }
+        
+        Console.Error.WriteLine($"[ZenConverter] Preload calculation: preloadSize={preloadSize}, preloadDependencyCount={preloadDependencyCount}");
+        
+        // Check if this is a SkeletalMesh or StaticMesh that needs material slot padding
+        bool isSkeletalMesh = asset.Exports.Any(e => 
+            e.GetExportClassType()?.Value?.Value == "SkeletalMesh" ||
+            e.GetExportClassType()?.Value?.Value?.Contains("SkeletalMesh") == true);
+        
+        bool isStaticMesh = asset.Exports.Any(e => 
+            e.GetExportClassType()?.Value?.Value == "StaticMesh");
+        
+        byte[] exportDataToWrite = uexpData;
+        
+        if (isSkeletalMesh)
+        {
+            // Apply material slot padding fix for SkeletalMesh assets
+            // Note: The export map size was already updated in BuildExportMapWithRecalculatedSizes
+            var patchResult = PatchSkeletalMeshMaterialSlots(uexpData, exportDataLength);
+            if (patchResult.patchedData != null)
+            {
+                exportDataToWrite = patchResult.patchedData;
+                exportDataLength = patchResult.patchedData.Length;
+                Console.Error.WriteLine($"[ZenConverter] Applied SkeletalMesh material padding: {patchResult.materialCount} materials, added {patchResult.materialCount * 4} bytes");
+            }
+        }
+        else if (isStaticMesh)
+        {
+            // DISABLED: StaticMesh padding - testing without it first
+            Console.Error.WriteLine($"[ZenConverter] StaticMesh patching disabled for testing");
+        }
+        
+        // Write export data (possibly patched)
+        Console.Error.WriteLine($"[ZenConverter] Writing export data: {exportDataLength} bytes (original uexp was {uexpData.Length} bytes)");
+        writer.Write(exportDataToWrite, 0, exportDataLength);
+        
+        // CookedHeaderSize points to where actual export data starts (after preload)
+        // HeaderSize is where the Zen header ends, CookedHeaderSize is where exports start
+        int cookedHeaderSize = zenHeaderSize + preloadSize;
 
         // Update summary with calculated offsets
         zenPackage.Summary.HeaderSize = (uint)zenHeaderSize;
-        // CookedHeaderSize should equal HeaderSize for Zen packages (no separate cooked header)
-        zenPackage.Summary.CookedHeaderSize = (uint)zenHeaderSize;
+        zenPackage.Summary.CookedHeaderSize = (uint)cookedHeaderSize;
         zenPackage.Summary.ImportedPublicExportHashesOffset = importedPublicExportHashesOffset;
         zenPackage.Summary.ImportMapOffset = importMapOffset;
         zenPackage.Summary.ExportMapOffset = exportMapOffset;
@@ -982,6 +1423,385 @@ public class ZenConverter
         asset.UseSeparateBulkDataFiles = true;
         return asset;
     }
+    
+    /// <summary>
+    /// Calculate how much material padding will be needed for a SkeletalMesh.
+    /// Returns the total padding in bytes (materialCount * 4).
+    /// </summary>
+    private static int CalculateSkeletalMeshMaterialPadding(byte[] uexpData)
+    {
+        const int MAX_MATERIAL_COUNT = 50;
+        const int MATERIAL_STRUCT_SIZE = 40;
+        const int PADDING_SIZE = 4;
+        int dataLength = uexpData.Length;
+        
+        // Find material array by looking for consecutive FPackageIndex imports spaced 40 bytes apart
+        for (int i = 4; i < dataLength - (MATERIAL_STRUCT_SIZE * 2); i++)
+        {
+            int potentialCount = BitConverter.ToInt32(uexpData, i);
+            if (potentialCount < 1 || potentialCount > MAX_MATERIAL_COUNT)
+                continue;
+            
+            int firstPkgIdx = BitConverter.ToInt32(uexpData, i + 4);
+            if (firstPkgIdx >= 0 || firstPkgIdx < -100)
+                continue;
+            
+            bool validPattern = true;
+            int validCount = 0;
+            for (int m = 0; m < potentialCount && m < 10; m++)
+            {
+                int matOffset = i + 4 + (m * MATERIAL_STRUCT_SIZE);
+                if (matOffset + 4 > dataLength)
+                {
+                    validPattern = false;
+                    break;
+                }
+                
+                int pkgIdx = BitConverter.ToInt32(uexpData, matOffset);
+                if (pkgIdx >= 0 || pkgIdx < -100)
+                {
+                    validPattern = false;
+                    break;
+                }
+                validCount++;
+            }
+            
+            if (validPattern && validCount >= 2)
+            {
+                return potentialCount * PADDING_SIZE;
+            }
+        }
+        
+        return 0;
+    }
+    
+    /// <summary>
+    /// Patch SkeletalMesh .uexp data by adding 4-byte FGameplayTagContainer padding after each material slot.
+    /// Marvel Rivals expects an FGameplayTagContainer (empty = 4 bytes of zeros) after each FSkeletalMaterial.
+    /// 
+    /// The algorithm finds the material array by looking for a sequence of FPackageIndex values (negative int32s)
+    /// that are spaced exactly 40 bytes apart. The material count is the int32 immediately before the first material.
+    /// </summary>
+    private static (byte[]? patchedData, int materialCount) PatchSkeletalMeshMaterialSlots(byte[] uexpData, int dataLength)
+    {
+        const int MAX_MATERIAL_COUNT = 50;
+        const int MATERIAL_STRUCT_SIZE = 40;
+        const int PADDING_SIZE = 4; // Empty FGameplayTagContainer = int32 count of 0
+        
+        // Find material array by looking for consecutive FPackageIndex imports spaced 40 bytes apart
+        // FPackageIndex for imports are negative values (e.g., -1, -2, -3, etc.)
+        int materialCountOffset = -1;
+        int materialCount = 0;
+        int firstMaterialOffset = -1;
+        
+        // Search for pattern: int32 count followed by materials with FPackageIndex at start
+        for (int i = 4; i < dataLength - (MATERIAL_STRUCT_SIZE * 2); i++)
+        {
+            int potentialCount = BitConverter.ToInt32(uexpData, i);
+            if (potentialCount < 1 || potentialCount > MAX_MATERIAL_COUNT)
+                continue;
+            
+            // Check if next bytes look like an FPackageIndex (negative value for import)
+            int firstPkgIdx = BitConverter.ToInt32(uexpData, i + 4);
+            if (firstPkgIdx >= 0 || firstPkgIdx < -100)
+                continue;
+            
+            // Verify by checking if subsequent materials are spaced 40 bytes apart
+            bool validPattern = true;
+            int validCount = 0;
+            for (int m = 0; m < potentialCount && m < 10; m++)
+            {
+                int matOffset = i + 4 + (m * MATERIAL_STRUCT_SIZE);
+                if (matOffset + 4 > dataLength)
+                {
+                    validPattern = false;
+                    break;
+                }
+                
+                int pkgIdx = BitConverter.ToInt32(uexpData, matOffset);
+                // FPackageIndex for material imports should be negative
+                if (pkgIdx >= 0 || pkgIdx < -100)
+                {
+                    validPattern = false;
+                    break;
+                }
+                validCount++;
+            }
+            
+            if (validPattern && validCount >= 2)
+            {
+                materialCountOffset = i;
+                materialCount = potentialCount;
+                firstMaterialOffset = i + 4;
+                Console.Error.WriteLine($"[ZenConverter] Found material array: count={materialCount} at offset 0x{materialCountOffset:X}, first material at 0x{firstMaterialOffset:X}");
+                break;
+            }
+        }
+        
+        if (materialCount == 0 || firstMaterialOffset < 0)
+        {
+            Console.Error.WriteLine($"[ZenConverter] No material array found to patch");
+            return (null, 0);
+        }
+        
+        // Calculate new size with padding (4 bytes per material for empty FGameplayTagContainer)
+        int paddingTotal = materialCount * PADDING_SIZE;
+        int newLength = dataLength + paddingTotal;
+        byte[] patchedData = new byte[newLength];
+        
+        // Copy data up to first material
+        Array.Copy(uexpData, 0, patchedData, 0, firstMaterialOffset);
+        
+        int srcOffset = firstMaterialOffset;
+        int dstOffset = firstMaterialOffset;
+        
+        // For each material, copy 40 bytes then add 4 bytes of zero padding (empty FGameplayTagContainer)
+        for (int m = 0; m < materialCount; m++)
+        {
+            if (srcOffset + MATERIAL_STRUCT_SIZE > dataLength)
+                break;
+                
+            // Copy material struct (40 bytes)
+            Array.Copy(uexpData, srcOffset, patchedData, dstOffset, MATERIAL_STRUCT_SIZE);
+            srcOffset += MATERIAL_STRUCT_SIZE;
+            dstOffset += MATERIAL_STRUCT_SIZE;
+            
+            // Add 4 bytes of zero padding (empty FGameplayTagContainer: count = 0)
+            patchedData[dstOffset] = 0x00;
+            patchedData[dstOffset + 1] = 0x00;
+            patchedData[dstOffset + 2] = 0x00;
+            patchedData[dstOffset + 3] = 0x00;
+            dstOffset += PADDING_SIZE;
+        }
+        
+        // Copy remaining data after materials
+        int remainingBytes = dataLength - srcOffset;
+        if (remainingBytes > 0)
+        {
+            Array.Copy(uexpData, srcOffset, patchedData, dstOffset, remainingBytes);
+        }
+        
+        Console.Error.WriteLine($"[ZenConverter] Patched {materialCount} materials with FGameplayTagContainer padding (+{paddingTotal} bytes)");
+        return (patchedData, materialCount);
+    }
+    
+    /// <summary>
+    /// Calculate how much material padding will be needed for a StaticMesh.
+    /// Returns the total padding in bytes (materialCount * 4).
+    /// FStaticMaterial struct size is 34 bytes without padding.
+    /// StaticMaterials array is typically near the END of the file after render data.
+    /// </summary>
+    private static int CalculateStaticMeshMaterialPadding(byte[] uexpData)
+    {
+        const int MAX_MATERIAL_COUNT = 50;
+        const int STATIC_MATERIAL_STRUCT_SIZE = 36; // FPackageIndex(4) + FName(8) + FMeshUVChannelInfo(20) + FPackageIndex(4)
+        const int PADDING_SIZE = 4;
+        int dataLength = uexpData.Length;
+        
+        // StaticMaterials array is near the end of the file after render data
+        // Search backwards from the end to find the pattern more efficiently
+        int searchStart = Math.Max(4, dataLength - 2000); // Search last 2KB
+        
+        // Search up to near the end - materials can end at or past dataLength
+        for (int i = searchStart; i < dataLength - 4; i++)
+        {
+            int potentialCount = BitConverter.ToInt32(uexpData, i);
+            if (potentialCount < 1 || potentialCount > MAX_MATERIAL_COUNT)
+                continue;
+            
+            int firstPkgIdx = BitConverter.ToInt32(uexpData, i + 4);
+            // FPackageIndex for imports are negative values
+            if (firstPkgIdx >= 0 || firstPkgIdx < -100)
+                continue;
+            
+            // Verify the structure looks like FStaticMaterial
+            // Check if the expected end of materials array is near the end of file
+            int expectedEnd = i + 4 + (potentialCount * STATIC_MATERIAL_STRUCT_SIZE);
+            
+            // Single material case - material array ends exactly at dataLength (before footer)
+            if (potentialCount == 1 && expectedEnd >= dataLength - 4 && expectedEnd <= dataLength)
+            {
+                int fnameIdx = BitConverter.ToInt32(uexpData, i + 8);
+                if (fnameIdx >= 0 && fnameIdx < 1000)
+                {
+                    Console.Error.WriteLine($"[ZenConverter] Found StaticMaterials: count={potentialCount} at offset 0x{i:X}, expectedEnd={expectedEnd}, dataLength={dataLength}");
+                    return potentialCount * PADDING_SIZE;
+                }
+            }
+            
+            if (expectedEnd > dataLength - 20 || expectedEnd < dataLength - 100)
+            {
+                continue;
+            }
+            
+            // Verify by checking if subsequent materials are spaced 34 bytes apart
+            bool validPattern = true;
+            int validCount = 0;
+            for (int m = 0; m < potentialCount && m < 10; m++)
+            {
+                int matOffset = i + 4 + (m * STATIC_MATERIAL_STRUCT_SIZE);
+                if (matOffset + 4 > dataLength)
+                {
+                    validPattern = false;
+                    break;
+                }
+                
+                int pkgIdx = BitConverter.ToInt32(uexpData, matOffset);
+                if (pkgIdx >= 0 || pkgIdx < -100)
+                {
+                    validPattern = false;
+                    break;
+                }
+                validCount++;
+            }
+            
+            if (validPattern && validCount >= 1)
+            {
+                Console.Error.WriteLine($"[ZenConverter] Found StaticMaterials: count={potentialCount} at offset 0x{i:X}");
+                return potentialCount * PADDING_SIZE;
+            }
+        }
+        
+        return 0;
+    }
+    
+    /// <summary>
+    /// Patch StaticMesh .uexp data by adding 4-byte padding after each FStaticMaterial slot.
+    /// Marvel Rivals expects extra padding (similar to FragPunk/WorldofJadeDynasty in CUE4Parse).
+    /// StaticMaterials array is near the END of the file after render data.
+    /// </summary>
+    private static (byte[]? patchedData, int materialCount) PatchStaticMeshMaterialSlots(byte[] uexpData, int dataLengthWithoutFooter)
+    {
+        const int MAX_MATERIAL_COUNT = 50;
+        const int STATIC_MATERIAL_STRUCT_SIZE = 36; // FPackageIndex(4) + FName(8) + FMeshUVChannelInfo(20) + FPackageIndex(4)
+        const int PADDING_SIZE = 4;
+        
+        // Use the length without footer for searching and size calculations
+        int dataLength = dataLengthWithoutFooter;
+        
+        int materialCountOffset = -1;
+        int materialCount = 0;
+        int firstMaterialOffset = -1;
+        
+        // StaticMaterials array is near the end of the file after render data
+        int searchStart = Math.Max(4, dataLength - 2000); // Search last 2KB
+        
+        // Search up to near the end - materials can end at or past dataLength
+        for (int i = searchStart; i < dataLength - 4; i++)
+        {
+            int potentialCount = BitConverter.ToInt32(uexpData, i);
+            if (potentialCount < 1 || potentialCount > MAX_MATERIAL_COUNT)
+                continue;
+            
+            int firstPkgIdx = BitConverter.ToInt32(uexpData, i + 4);
+            if (firstPkgIdx >= 0 || firstPkgIdx < -100)
+                continue;
+            
+            // Check if the expected end of materials array is near the end of file
+            int expectedEnd = i + 4 + (potentialCount * STATIC_MATERIAL_STRUCT_SIZE);
+            
+            // Single material case - verify structure
+            // Material array can end exactly at dataLength or slightly before
+            if (potentialCount == 1 && expectedEnd >= dataLength - 10 && expectedEnd <= dataLength + 10)
+            {
+                int fnameIdx = BitConverter.ToInt32(uexpData, i + 8);
+                if (fnameIdx >= 0 && fnameIdx < 1000)
+                {
+                    materialCountOffset = i;
+                    materialCount = potentialCount;
+                    firstMaterialOffset = i + 4;
+                    Console.Error.WriteLine($"[ZenConverter] Found StaticMaterial array: count={materialCount} at offset 0x{materialCountOffset:X}, first material at 0x{firstMaterialOffset:X}, expectedEnd={expectedEnd}, dataLength={dataLength}");
+                    break;
+                }
+            }
+            
+            // Multi-material case - verify spacing
+            if (expectedEnd <= dataLength - 20 && expectedEnd >= dataLength - 100)
+            {
+                bool validPattern = true;
+                int validCount = 0;
+                for (int m = 0; m < potentialCount && m < 10; m++)
+                {
+                    int matOffset = i + 4 + (m * STATIC_MATERIAL_STRUCT_SIZE);
+                    if (matOffset + 4 > dataLength)
+                    {
+                        validPattern = false;
+                        break;
+                    }
+                    
+                    int pkgIdx = BitConverter.ToInt32(uexpData, matOffset);
+                    if (pkgIdx >= 0 || pkgIdx < -100)
+                    {
+                        validPattern = false;
+                        break;
+                    }
+                    validCount++;
+                }
+                
+                if (validPattern && validCount >= 1)
+                {
+                    materialCountOffset = i;
+                    materialCount = potentialCount;
+                    firstMaterialOffset = i + 4;
+                    Console.Error.WriteLine($"[ZenConverter] Found StaticMaterial array: count={materialCount} at offset 0x{materialCountOffset:X}, first material at 0x{firstMaterialOffset:X}");
+                    break;
+                }
+            }
+        }
+        
+        if (materialCount == 0 || firstMaterialOffset < 0)
+        {
+            Console.Error.WriteLine($"[ZenConverter] No StaticMaterial array found to patch");
+            return (null, 0);
+        }
+        
+        // Calculate new size with padding
+        int paddingTotal = materialCount * PADDING_SIZE;
+        int newLength = dataLength + paddingTotal;
+        byte[] patchedData = new byte[newLength];
+        
+        // Copy data up to first material
+        Array.Copy(uexpData, 0, patchedData, 0, firstMaterialOffset);
+        
+        int srcOffset = firstMaterialOffset;
+        int dstOffset = firstMaterialOffset;
+        
+        // For each material, copy 34 bytes then add 4 bytes of zero padding
+        for (int m = 0; m < materialCount; m++)
+        {
+            if (srcOffset + STATIC_MATERIAL_STRUCT_SIZE > dataLength)
+            {
+                Console.Error.WriteLine($"[ZenConverter] WARNING: srcOffset {srcOffset} + {STATIC_MATERIAL_STRUCT_SIZE} > dataLength {dataLength}");
+                break;
+            }
+                
+            // Copy material struct (34 bytes)
+            Console.Error.WriteLine($"[ZenConverter] Copying material {m}: src=0x{srcOffset:X} -> dst=0x{dstOffset:X}, size={STATIC_MATERIAL_STRUCT_SIZE}");
+            Array.Copy(uexpData, srcOffset, patchedData, dstOffset, STATIC_MATERIAL_STRUCT_SIZE);
+            srcOffset += STATIC_MATERIAL_STRUCT_SIZE;
+            dstOffset += STATIC_MATERIAL_STRUCT_SIZE;
+            
+            // Add 4 bytes of zero padding
+            Console.Error.WriteLine($"[ZenConverter] Adding padding at dst=0x{dstOffset:X}");
+            patchedData[dstOffset] = 0x00;
+            patchedData[dstOffset + 1] = 0x00;
+            patchedData[dstOffset + 2] = 0x00;
+            patchedData[dstOffset + 3] = 0x00;
+            dstOffset += PADDING_SIZE;
+        }
+        
+        // Copy remaining data after materials
+        int remainingBytes = dataLength - srcOffset;
+        if (remainingBytes > 0)
+        {
+            Array.Copy(uexpData, srcOffset, patchedData, dstOffset, remainingBytes);
+        }
+        
+        Console.Error.WriteLine($"[ZenConverter] Patched {materialCount} StaticMaterials with padding (+{paddingTotal} bytes)");
+        Console.Error.WriteLine($"[ZenConverter] Original data length: {dataLength}, Patched data length: {newLength}");
+        Console.Error.WriteLine($"[ZenConverter] srcOffset after patching: {srcOffset}, dstOffset after patching: {dstOffset}, remainingBytes: {remainingBytes}");
+        return (patchedData, materialCount);
+    }
 }
 
 /// <summary>
@@ -1005,6 +1825,9 @@ public class FZenPackage
     public List<ulong> ImportedPackages { get; set; }
     public List<string> ImportedPackageNames { get; set; }
     public List<ulong> ImportedPublicExportHashes { get; set; }
+    
+    // Export reorder mapping: old index -> new index
+    public Dictionary<int, int> ExportReorderMap { get; set; }
 
     public FZenPackage()
     {
@@ -1019,5 +1842,6 @@ public class FZenPackage
         ImportedPackages = new List<ulong>();
         ImportedPackageNames = new List<string>();
         ImportedPublicExportHashes = new List<ulong>();
+        ExportReorderMap = new Dictionary<int, int>();
     }
 }

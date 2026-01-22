@@ -165,6 +165,13 @@ public class ScriptObjectsDatabase
                 {
                     db._scriptObjectsByName[fullPath] = globalIndex;
                 }
+                
+                // Also store by simple name for fallback lookup (if not already present)
+                // This allows looking up "SkeletalMesh" without the full path
+                if (!db._scriptObjectsByName.ContainsKey(objectName))
+                {
+                    db._scriptObjectsByName[objectName] = globalIndex;
+                }
             }
         }
         
@@ -175,17 +182,61 @@ public class ScriptObjectsDatabase
     
     private static string BuildFullPath(ScriptObjectsDatabase db, string objectName, ulong outerIndex)
     {
-        // For now, just return the object name
-        // TODO: Walk the outer chain to build full path like /Script/Engine/StaticMesh
-        return objectName;
+        // Build full path by walking the outer chain
+        var pathParts = new List<string> { objectName };
+        
+        ulong currentOuter = outerIndex;
+        int maxDepth = 20; // Prevent infinite loops
+        
+        while (currentOuter != 0 && currentOuter != ~0ul && maxDepth-- > 0)
+        {
+            if (db._scriptObjectsByIndex.TryGetValue(currentOuter, out var outerEntry))
+            {
+                int nameIdx = (int)outerEntry.ObjectName.Index;
+                if (nameIdx >= 0 && nameIdx < db._nameMap.Count)
+                {
+                    pathParts.Add(db._nameMap[nameIdx]);
+                }
+                currentOuter = outerEntry.OuterIndex.Value;
+            }
+            else
+            {
+                break;
+            }
+        }
+        
+        // Reverse to get path from root to object
+        pathParts.Reverse();
+        return string.Join("/", pathParts);
     }
     
     /// <summary>
-    /// Try to get the global index (hash) for a script object by its name
+    /// Try to get the global index (hash) for a script object by its name or full path
     /// </summary>
     public bool TryGetGlobalIndex(string objectName, out ulong globalIndex)
     {
-        return _scriptObjectsByName.TryGetValue(objectName, out globalIndex);
+        // First try exact match (could be full path or simple name)
+        if (_scriptObjectsByName.TryGetValue(objectName, out globalIndex))
+            return true;
+        
+        // If it looks like a path, try just the last component
+        int lastSlash = objectName.LastIndexOf('/');
+        if (lastSlash >= 0)
+        {
+            string simpleName = objectName.Substring(lastSlash + 1);
+            return _scriptObjectsByName.TryGetValue(simpleName, out globalIndex);
+        }
+        
+        globalIndex = 0;
+        return false;
+    }
+    
+    /// <summary>
+    /// Try to get the global index for a script object by its full path (e.g., "/Script/Engine/SkeletalMesh")
+    /// </summary>
+    public bool TryGetGlobalIndexByPath(string fullPath, out ulong globalIndex)
+    {
+        return _scriptObjectsByName.TryGetValue(fullPath, out globalIndex);
     }
     
     /// <summary>
