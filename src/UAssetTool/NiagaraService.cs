@@ -823,7 +823,29 @@ public static class NiagaraService
                         continue;
                 }
 
-                if (className.Contains("ColorCurve") && export is NormalExport normalExport)
+                // Handle specialized ColorCurve export type
+                if (export is NiagaraDataInterfaceColorCurveExport colorCurveExport && colorCurveExport.ShaderLUT != null)
+                {
+                    for (int i = 0; i < colorCurveExport.ShaderLUT.Colors.Count; i++)
+                    {
+                        if (request.ColorIndex.HasValue && request.ColorIndex.Value != i)
+                            continue;
+                        if (request.ColorIndexStart.HasValue && i < request.ColorIndexStart.Value)
+                            continue;
+                        if (request.ColorIndexEnd.HasValue && i > request.ColorIndexEnd.Value)
+                            continue;
+
+                        var current = colorCurveExport.ShaderLUT.Colors[i];
+                        float newR = modifyR ? request.R : current.R;
+                        float newG = modifyG ? request.G : current.G;
+                        float newB = modifyB ? request.B : current.B;
+                        float newA = modifyA ? request.A : current.A;
+                        colorCurveExport.SetColor(i, newR, newG, newB, newA);
+                        modifiedCount++;
+                    }
+                }
+                // Fallback for unrecognized ColorCurve types
+                else if (className.Contains("ColorCurve") && export is NormalExport normalExport)
                 {
                     modifiedCount += ModifyShaderLUTSelective(
                         normalExport.Data, 
