@@ -467,11 +467,76 @@ public class FShaderLUT
 Added to `UAsset.cs` alongside other structured exports:
 
 ```csharp
-else if (exportClassType == "NiagaraDataInterfaceColorCurve" || 
-         exportClassType.EndsWith("DataInterfaceColorCurve"))
-{
+// ShaderLUT-based curve types
+else if (exportClassType == "NiagaraDataInterfaceColorCurve")
     Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceColorCurveExport>();
-}
+else if (exportClassType == "NiagaraDataInterfaceCurve")
+    Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceCurveExport>();
+else if (exportClassType == "NiagaraDataInterfaceVector2DCurve")
+    Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceVector2DCurveExport>();
+else if (exportClassType == "NiagaraDataInterfaceVectorCurve")
+    Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceVectorCurveExport>();
+
+// Array-based data interface types
+else if (exportClassType == "NiagaraDataInterfaceArrayColor")
+    Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceArrayColorExport>();
+else if (exportClassType == "NiagaraDataInterfaceArrayFloat")
+    Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceArrayFloatExport>();
+else if (exportClassType == "NiagaraDataInterfaceArrayFloat3")
+    Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceArrayFloat3Export>();
+else if (exportClassType == "NiagaraDataInterfaceArrayInt32")
+    Exports[i] = Exports[i].ConvertToChildExport<NiagaraDataInterfaceArrayInt32Export>();
+```
+
+---
+
+## Complete Niagara Data Interface Support
+
+### ShaderLUT-Based Curve Types
+
+These types store pre-baked gradient data in a `ShaderLUT` float array for GPU sampling:
+
+| Type | Data Format | Color Relevance | Use Case |
+|------|-------------|-----------------|----------|
+| **NiagaraDataInterfaceColorCurve** | RGBA (4 floats) | ✅ Direct RGBA | Color gradients over lifetime |
+| **NiagaraDataInterfaceVectorCurve** | XYZ (3 floats) | ✅ RGB (no alpha) | RGB color curves, 3D directions |
+| **NiagaraDataInterfaceCurve** | Single float | Indirect | Opacity, scale, speed curves |
+| **NiagaraDataInterfaceVector2DCurve** | XY (2 floats) | Indirect | UV offsets, 2D positions |
+
+### Array-Based Data Interface Types
+
+These types store direct value arrays in properties (`ColorData`, `FloatData`, `VectorData`):
+
+| Type | Property | Data Format | Color Relevance |
+|------|----------|-------------|-----------------|
+| **NiagaraDataInterfaceArrayColor** | `ColorData` | LinearColor[] | ✅ Direct RGBA |
+| **NiagaraDataInterfaceArrayFloat3** | `VectorData` | Vector3[] | ✅ RGB (no alpha) |
+| **NiagaraDataInterfaceArrayFloat** | `FloatData` | float[] | Indirect (opacity) |
+| **NiagaraDataInterfaceArrayInt32** | `IntData` | int[] | Not color-related |
+
+### ShaderLUT Memory Layouts
+
+**ColorCurve (RGBA - 4 floats per entry):**
+```
+[R₀, G₀, B₀, A₀, R₁, G₁, B₁, A₁, R₂, G₂, B₂, A₂, ...]
+ └─ Color 0 ─┘  └─ Color 1 ─┘  └─ Color 2 ─┘
+```
+
+**VectorCurve (XYZ/RGB - 3 floats per entry):**
+```
+[X₀, Y₀, Z₀, X₁, Y₁, Z₁, X₂, Y₂, Z₂, ...]
+ └ Vec 0 ┘  └ Vec 1 ┘  └ Vec 2 ┘
+```
+
+**Curve (single float per entry):**
+```
+[V₀, V₁, V₂, V₃, ...]
+```
+
+**Vector2DCurve (XY - 2 floats per entry):**
+```
+[X₀, Y₀, X₁, Y₁, X₂, Y₂, ...]
+ └Vec0┘  └Vec1┘  └Vec2┘
 ```
 
 ### Understanding ShaderLUT Contents
@@ -568,10 +633,48 @@ public class ColorEditRequest
 
 | File | Purpose |
 |------|---------|
-| `NiagaraStructs.cs` | `FShaderLUT`, `FShaderLUTColor`, `FRichCurve` structs |
-| `NiagaraDataInterfaceColorCurveExport.cs` | Structured export type |
-| `ColorModifier.cs` | Uses structured export for color modification |
-| `NiagaraService.cs` | Frontend JSON API |
+| `NiagaraStructs.cs` | `FShaderLUT`, `FShaderLUTColor`, `FShaderLUTFloat`, `FShaderLUTVector2D`, `FShaderLUTVector3` structs |
+| `NiagaraDataInterfaceColorCurveExport.cs` | ColorCurve export (RGBA ShaderLUT) |
+| `NiagaraDataInterfaceCurveExport.cs` | Curve export (float ShaderLUT) |
+| `NiagaraDataInterfaceVector2DCurveExport.cs` | Vector2DCurve export (XY ShaderLUT) |
+| `NiagaraDataInterfaceVectorCurveExport.cs` | VectorCurve export (XYZ/RGB ShaderLUT) |
+| `NiagaraDataInterfaceArrayExports.cs` | ArrayColor, ArrayFloat, ArrayFloat3, ArrayInt32 exports |
+| `ColorModifier.cs` | Uses structured exports for color modification |
+| `NiagaraService.cs` | Frontend JSON API with all curve type support |
+
+### NiagaraDetailsResult Structure
+
+The `niagara_details` command returns comprehensive information about all data interfaces:
+
+```json
+{
+  "success": true,
+  "totalExports": 269,
+  // ShaderLUT-based curves
+  "colorCurveCount": 12,
+  "totalColorCount": 1536,
+  "colorCurves": [...],
+  "floatCurveCount": 40,
+  "totalFloatCount": 2120,
+  "floatCurves": [...],
+  "vector2DCurveCount": 0,
+  "totalVector2DCount": 0,
+  "vector2DCurves": [],
+  "vector3CurveCount": 8,
+  "totalVector3Count": 1024,
+  "vector3Curves": [...],
+  // Array-based data interfaces
+  "arrayColorCount": 4,
+  "totalArrayColorValues": 12,
+  "arrayColors": [...],
+  "arrayFloatCount": 10,
+  "totalArrayFloatValues": 30,
+  "arrayFloats": [...],
+  "arrayFloat3Count": 0,
+  "totalArrayFloat3Values": 0,
+  "arrayFloat3s": []
+}
+```
 
 ---
 
