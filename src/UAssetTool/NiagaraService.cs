@@ -66,6 +66,63 @@ public static class NiagaraService
         public float A { get; set; }
     }
 
+    /// <summary>
+    /// Info for NiagaraDataInterfaceCurve (float curves)
+    /// </summary>
+    public class FloatCurveInfo
+    {
+        public int ExportIndex { get; set; }
+        public string ExportName { get; set; } = "";
+        public string ClassName { get; set; } = "";
+        public int ValueCount { get; set; }
+        public List<FloatValue> SampleValues { get; set; } = new();
+    }
+
+    public class FloatValue
+    {
+        public int Index { get; set; }
+        public float Value { get; set; }
+    }
+
+    /// <summary>
+    /// Info for NiagaraDataInterfaceVector2DCurve
+    /// </summary>
+    public class Vector2DCurveInfo
+    {
+        public int ExportIndex { get; set; }
+        public string ExportName { get; set; } = "";
+        public string ClassName { get; set; } = "";
+        public int ValueCount { get; set; }
+        public List<Vector2DValue> SampleValues { get; set; } = new();
+    }
+
+    public class Vector2DValue
+    {
+        public int Index { get; set; }
+        public float X { get; set; }
+        public float Y { get; set; }
+    }
+
+    /// <summary>
+    /// Info for NiagaraDataInterfaceVectorCurve (Vector3/RGB curves)
+    /// </summary>
+    public class Vector3CurveInfo
+    {
+        public int ExportIndex { get; set; }
+        public string ExportName { get; set; } = "";
+        public string ClassName { get; set; } = "";
+        public int ValueCount { get; set; }
+        public List<Vector3Value> SampleValues { get; set; } = new();
+    }
+
+    public class Vector3Value
+    {
+        public int Index { get; set; }
+        public float X { get; set; }
+        public float Y { get; set; }
+        public float Z { get; set; }
+    }
+
     public class NiagaraDetailsResult
     {
         public bool Success { get; set; }
@@ -76,6 +133,61 @@ public static class NiagaraService
         public int ColorCurveCount { get; set; }
         public int TotalColorCount { get; set; }
         public List<ColorCurveInfo> ColorCurves { get; set; } = new();
+        public int FloatCurveCount { get; set; }
+        public int TotalFloatCount { get; set; }
+        public List<FloatCurveInfo> FloatCurves { get; set; } = new();
+        public int Vector2DCurveCount { get; set; }
+        public int TotalVector2DCount { get; set; }
+        public List<Vector2DCurveInfo> Vector2DCurves { get; set; } = new();
+        public int Vector3CurveCount { get; set; }
+        public int TotalVector3Count { get; set; }
+        public List<Vector3CurveInfo> Vector3Curves { get; set; } = new();
+        // Array-based data interfaces
+        public int ArrayColorCount { get; set; }
+        public int TotalArrayColorValues { get; set; }
+        public List<ArrayColorInfo> ArrayColors { get; set; } = new();
+        public int ArrayFloatCount { get; set; }
+        public int TotalArrayFloatValues { get; set; }
+        public List<ArrayFloatInfo> ArrayFloats { get; set; } = new();
+        public int ArrayFloat3Count { get; set; }
+        public int TotalArrayFloat3Values { get; set; }
+        public List<ArrayFloat3Info> ArrayFloat3s { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Info for NiagaraDataInterfaceArrayColor
+    /// </summary>
+    public class ArrayColorInfo
+    {
+        public int ExportIndex { get; set; }
+        public string ExportName { get; set; } = "";
+        public string ClassName { get; set; } = "";
+        public int ColorCount { get; set; }
+        public List<ColorValue> SampleColors { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Info for NiagaraDataInterfaceArrayFloat
+    /// </summary>
+    public class ArrayFloatInfo
+    {
+        public int ExportIndex { get; set; }
+        public string ExportName { get; set; } = "";
+        public string ClassName { get; set; } = "";
+        public int ValueCount { get; set; }
+        public List<FloatValue> SampleValues { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Info for NiagaraDataInterfaceArrayFloat3 (RGB arrays)
+    /// </summary>
+    public class ArrayFloat3Info
+    {
+        public int ExportIndex { get; set; }
+        public string ExportName { get; set; } = "";
+        public string ClassName { get; set; } = "";
+        public int ValueCount { get; set; }
+        public List<Vector3Value> SampleValues { get; set; } = new();
     }
 
     public class ColorEditRequest
@@ -102,6 +214,37 @@ public static class NiagaraService
         public string? Error { get; set; }
         public string Path { get; set; } = "";
         public int ModifiedCount { get; set; }
+    }
+
+    /// <summary>
+    /// Request to edit float curve values (NiagaraDataInterfaceCurve)
+    /// </summary>
+    public class FloatCurveEditRequest
+    {
+        public string AssetPath { get; set; } = "";
+        public float Value { get; set; }
+        public int? ExportIndex { get; set; }
+        public string? ExportNameFilter { get; set; }
+        public int? ValueIndex { get; set; }
+        public int? ValueIndexStart { get; set; }
+        public int? ValueIndexEnd { get; set; }
+    }
+
+    /// <summary>
+    /// Request to edit Vector2D curve values (NiagaraDataInterfaceVector2DCurve)
+    /// </summary>
+    public class Vector2DCurveEditRequest
+    {
+        public string AssetPath { get; set; } = "";
+        public float X { get; set; }
+        public float Y { get; set; }
+        public int? ExportIndex { get; set; }
+        public string? ExportNameFilter { get; set; }
+        public int? ValueIndex { get; set; }
+        public int? ValueIndexStart { get; set; }
+        public int? ValueIndexEnd { get; set; }
+        public bool? ModifyX { get; set; }  // Default: true
+        public bool? ModifyY { get; set; }  // Default: true
     }
 
     #endregion
@@ -215,18 +358,18 @@ public static class NiagaraService
             {
                 var export = asset.Exports[i];
                 string className = export.GetExportClassType()?.Value?.Value ?? "";
+                string exportName = export.ObjectName?.Value?.Value ?? $"Export_{i}";
 
-                // Use structured NiagaraDataInterfaceColorCurveExport if available
+                // NiagaraDataInterfaceColorCurve - RGBA colors
                 if (export is NiagaraDataInterfaceColorCurveExport colorCurveExport)
                 {
                     var curveInfo = new ColorCurveInfo
                     {
                         ExportIndex = i,
-                        ExportName = export.ObjectName?.Value?.Value ?? $"Export_{i}",
+                        ExportName = exportName,
                         ClassName = className
                     };
 
-                    // Extract color data from structured export
                     var colors = ExtractColorsFromStructuredExport(colorCurveExport);
                     curveInfo.ColorCount = colors.Count;
 
@@ -243,21 +386,86 @@ public static class NiagaraService
                     result.ColorCurves.Add(curveInfo);
                     result.TotalColorCount += curveInfo.ColorCount;
                 }
+                // NiagaraDataInterfaceCurve - single float values
+                else if (export is NiagaraDataInterfaceCurveExport floatCurveExport)
+                {
+                    var curveInfo = new FloatCurveInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className,
+                        ValueCount = floatCurveExport.ValueCount
+                    };
+
+                    // Sample first, middle, and last values
+                    if (floatCurveExport.ValueCount > 0)
+                    {
+                        curveInfo.SampleValues.Add(new FloatValue { Index = 0, Value = floatCurveExport.GetValue(0) ?? 0 });
+                        if (floatCurveExport.ValueCount > 2)
+                        {
+                            int mid = floatCurveExport.ValueCount / 2;
+                            curveInfo.SampleValues.Add(new FloatValue { Index = mid, Value = floatCurveExport.GetValue(mid) ?? 0 });
+                        }
+                        if (floatCurveExport.ValueCount > 1)
+                        {
+                            int last = floatCurveExport.ValueCount - 1;
+                            curveInfo.SampleValues.Add(new FloatValue { Index = last, Value = floatCurveExport.GetValue(last) ?? 0 });
+                        }
+                    }
+
+                    result.FloatCurves.Add(curveInfo);
+                    result.TotalFloatCount += curveInfo.ValueCount;
+                }
+                // NiagaraDataInterfaceVector2DCurve - Vector2D values
+                else if (export is NiagaraDataInterfaceVector2DCurveExport vec2CurveExport)
+                {
+                    var curveInfo = new Vector2DCurveInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className,
+                        ValueCount = vec2CurveExport.ValueCount
+                    };
+
+                    // Sample first, middle, and last values
+                    if (vec2CurveExport.ValueCount > 0)
+                    {
+                        var v0 = vec2CurveExport.GetValue(0);
+                        if (v0.HasValue)
+                            curveInfo.SampleValues.Add(new Vector2DValue { Index = 0, X = v0.Value.X, Y = v0.Value.Y });
+                        
+                        if (vec2CurveExport.ValueCount > 2)
+                        {
+                            int mid = vec2CurveExport.ValueCount / 2;
+                            var vm = vec2CurveExport.GetValue(mid);
+                            if (vm.HasValue)
+                                curveInfo.SampleValues.Add(new Vector2DValue { Index = mid, X = vm.Value.X, Y = vm.Value.Y });
+                        }
+                        if (vec2CurveExport.ValueCount > 1)
+                        {
+                            int last = vec2CurveExport.ValueCount - 1;
+                            var vl = vec2CurveExport.GetValue(last);
+                            if (vl.HasValue)
+                                curveInfo.SampleValues.Add(new Vector2DValue { Index = last, X = vl.Value.X, Y = vl.Value.Y });
+                        }
+                    }
+
+                    result.Vector2DCurves.Add(curveInfo);
+                    result.TotalVector2DCount += curveInfo.ValueCount;
+                }
+                // Fallback for unrecognized color curve types
                 else if (className.Contains("ColorCurve") && export is NormalExport normalExport)
                 {
-                    // Fallback for unrecognized color curve types
                     var curveInfo = new ColorCurveInfo
                     {
                         ExportIndex = i,
-                        ExportName = export.ObjectName?.Value?.Value ?? $"Export_{i}",
+                        ExportName = exportName,
                         ClassName = className
                     };
 
-                    // Extract color data from properties
                     var colors = ExtractColorsFromExport(normalExport);
                     curveInfo.ColorCount = colors.Count;
 
-                    // Sample first, middle, and last colors
                     if (colors.Count > 0)
                     {
                         curveInfo.SampleColors.Add(colors[0]);
@@ -270,9 +478,227 @@ public static class NiagaraService
                     result.ColorCurves.Add(curveInfo);
                     result.TotalColorCount += curveInfo.ColorCount;
                 }
+                // Fallback for unrecognized float curve types
+                else if (className.Contains("DataInterfaceCurve") && !className.Contains("Color") && !className.Contains("Vector") && export is NormalExport floatNormalExport)
+                {
+                    var curveInfo = new FloatCurveInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className
+                    };
+
+                    var values = ExtractFloatsFromExport(floatNormalExport);
+                    curveInfo.ValueCount = values.Count;
+
+                    if (values.Count > 0)
+                    {
+                        curveInfo.SampleValues.Add(values[0]);
+                        if (values.Count > 2)
+                            curveInfo.SampleValues.Add(values[values.Count / 2]);
+                        if (values.Count > 1)
+                            curveInfo.SampleValues.Add(values[values.Count - 1]);
+                    }
+
+                    result.FloatCurves.Add(curveInfo);
+                    result.TotalFloatCount += curveInfo.ValueCount;
+                }
+                // Fallback for unrecognized Vector2D curve types
+                else if (className.Contains("Vector2DCurve") && export is NormalExport vec2NormalExport)
+                {
+                    var curveInfo = new Vector2DCurveInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className
+                    };
+
+                    var values = ExtractVector2DsFromExport(vec2NormalExport);
+                    curveInfo.ValueCount = values.Count;
+
+                    if (values.Count > 0)
+                    {
+                        curveInfo.SampleValues.Add(values[0]);
+                        if (values.Count > 2)
+                            curveInfo.SampleValues.Add(values[values.Count / 2]);
+                        if (values.Count > 1)
+                            curveInfo.SampleValues.Add(values[values.Count - 1]);
+                    }
+
+                    result.Vector2DCurves.Add(curveInfo);
+                    result.TotalVector2DCount += curveInfo.ValueCount;
+                }
+                // NiagaraDataInterfaceVectorCurve - Vector3 values (can be RGB colors!)
+                else if (export is NiagaraDataInterfaceVectorCurveExport vec3CurveExport)
+                {
+                    var curveInfo = new Vector3CurveInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className,
+                        ValueCount = vec3CurveExport.ValueCount
+                    };
+
+                    if (vec3CurveExport.ValueCount > 0)
+                    {
+                        var v0 = vec3CurveExport.GetValue(0);
+                        if (v0.HasValue)
+                            curveInfo.SampleValues.Add(new Vector3Value { Index = 0, X = v0.Value.X, Y = v0.Value.Y, Z = v0.Value.Z });
+                        
+                        if (vec3CurveExport.ValueCount > 2)
+                        {
+                            int mid = vec3CurveExport.ValueCount / 2;
+                            var vm = vec3CurveExport.GetValue(mid);
+                            if (vm.HasValue)
+                                curveInfo.SampleValues.Add(new Vector3Value { Index = mid, X = vm.Value.X, Y = vm.Value.Y, Z = vm.Value.Z });
+                        }
+                        if (vec3CurveExport.ValueCount > 1)
+                        {
+                            int last = vec3CurveExport.ValueCount - 1;
+                            var vl = vec3CurveExport.GetValue(last);
+                            if (vl.HasValue)
+                                curveInfo.SampleValues.Add(new Vector3Value { Index = last, X = vl.Value.X, Y = vl.Value.Y, Z = vl.Value.Z });
+                        }
+                    }
+
+                    result.Vector3Curves.Add(curveInfo);
+                    result.TotalVector3Count += curveInfo.ValueCount;
+                }
+                // Fallback for unrecognized VectorCurve types (not Vector2D)
+                else if (className.Contains("VectorCurve") && !className.Contains("2D") && export is NormalExport vec3NormalExport)
+                {
+                    var curveInfo = new Vector3CurveInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className
+                    };
+
+                    var values = ExtractVector3sFromExport(vec3NormalExport);
+                    curveInfo.ValueCount = values.Count;
+
+                    if (values.Count > 0)
+                    {
+                        curveInfo.SampleValues.Add(values[0]);
+                        if (values.Count > 2)
+                            curveInfo.SampleValues.Add(values[values.Count / 2]);
+                        if (values.Count > 1)
+                            curveInfo.SampleValues.Add(values[values.Count - 1]);
+                    }
+
+                    result.Vector3Curves.Add(curveInfo);
+                    result.TotalVector3Count += curveInfo.ValueCount;
+                }
+                // NiagaraDataInterfaceArrayColor - direct color arrays
+                else if (export is NiagaraDataInterfaceArrayColorExport arrayColorExport)
+                {
+                    var info = new ArrayColorInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className,
+                        ColorCount = arrayColorExport.ColorCount
+                    };
+
+                    if (arrayColorExport.ColorCount > 0)
+                    {
+                        var c0 = arrayColorExport.GetColor(0);
+                        if (c0.HasValue)
+                            info.SampleColors.Add(new ColorValue { Index = 0, R = c0.Value.R, G = c0.Value.G, B = c0.Value.B, A = c0.Value.A });
+                        
+                        if (arrayColorExport.ColorCount > 2)
+                        {
+                            int mid = arrayColorExport.ColorCount / 2;
+                            var cm = arrayColorExport.GetColor(mid);
+                            if (cm.HasValue)
+                                info.SampleColors.Add(new ColorValue { Index = mid, R = cm.Value.R, G = cm.Value.G, B = cm.Value.B, A = cm.Value.A });
+                        }
+                        if (arrayColorExport.ColorCount > 1)
+                        {
+                            int last = arrayColorExport.ColorCount - 1;
+                            var cl = arrayColorExport.GetColor(last);
+                            if (cl.HasValue)
+                                info.SampleColors.Add(new ColorValue { Index = last, R = cl.Value.R, G = cl.Value.G, B = cl.Value.B, A = cl.Value.A });
+                        }
+                    }
+
+                    result.ArrayColors.Add(info);
+                    result.TotalArrayColorValues += info.ColorCount;
+                }
+                // NiagaraDataInterfaceArrayFloat - float arrays (opacity, scale)
+                else if (export is NiagaraDataInterfaceArrayFloatExport arrayFloatExport)
+                {
+                    var info = new ArrayFloatInfo
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className,
+                        ValueCount = arrayFloatExport.ValueCount
+                    };
+
+                    if (arrayFloatExport.ValueCount > 0)
+                    {
+                        info.SampleValues.Add(new FloatValue { Index = 0, Value = arrayFloatExport.GetValue(0) ?? 0 });
+                        if (arrayFloatExport.ValueCount > 2)
+                        {
+                            int mid = arrayFloatExport.ValueCount / 2;
+                            info.SampleValues.Add(new FloatValue { Index = mid, Value = arrayFloatExport.GetValue(mid) ?? 0 });
+                        }
+                        if (arrayFloatExport.ValueCount > 1)
+                        {
+                            int last = arrayFloatExport.ValueCount - 1;
+                            info.SampleValues.Add(new FloatValue { Index = last, Value = arrayFloatExport.GetValue(last) ?? 0 });
+                        }
+                    }
+
+                    result.ArrayFloats.Add(info);
+                    result.TotalArrayFloatValues += info.ValueCount;
+                }
+                // NiagaraDataInterfaceArrayFloat3 - Vector3/RGB arrays
+                else if (export is NiagaraDataInterfaceArrayFloat3Export arrayFloat3Export)
+                {
+                    var info = new ArrayFloat3Info
+                    {
+                        ExportIndex = i,
+                        ExportName = exportName,
+                        ClassName = className,
+                        ValueCount = arrayFloat3Export.ValueCount
+                    };
+
+                    if (arrayFloat3Export.ValueCount > 0)
+                    {
+                        var v0 = arrayFloat3Export.GetValue(0);
+                        if (v0.HasValue)
+                            info.SampleValues.Add(new Vector3Value { Index = 0, X = v0.Value.X, Y = v0.Value.Y, Z = v0.Value.Z });
+                        
+                        if (arrayFloat3Export.ValueCount > 2)
+                        {
+                            int mid = arrayFloat3Export.ValueCount / 2;
+                            var vm = arrayFloat3Export.GetValue(mid);
+                            if (vm.HasValue)
+                                info.SampleValues.Add(new Vector3Value { Index = mid, X = vm.Value.X, Y = vm.Value.Y, Z = vm.Value.Z });
+                        }
+                        if (arrayFloat3Export.ValueCount > 1)
+                        {
+                            int last = arrayFloat3Export.ValueCount - 1;
+                            var vl = arrayFloat3Export.GetValue(last);
+                            if (vl.HasValue)
+                                info.SampleValues.Add(new Vector3Value { Index = last, X = vl.Value.X, Y = vl.Value.Y, Z = vl.Value.Z });
+                        }
+                    }
+
+                    result.ArrayFloat3s.Add(info);
+                    result.TotalArrayFloat3Values += info.ValueCount;
+                }
             }
 
             result.ColorCurveCount = result.ColorCurves.Count;
+            result.FloatCurveCount = result.FloatCurves.Count;
+            result.Vector2DCurveCount = result.Vector2DCurves.Count;
+            result.Vector3CurveCount = result.Vector3Curves.Count;
+            result.ArrayColorCount = result.ArrayColors.Count;
+            result.ArrayFloatCount = result.ArrayFloats.Count;
+            result.ArrayFloat3Count = result.ArrayFloat3s.Count;
             result.Success = true;
         }
         catch (Exception ex)
@@ -389,6 +815,163 @@ public static class NiagaraService
         return JsonSerializer.Serialize(result, JsonOptions);
     }
 
+    /// <summary>
+    /// Edit float curve values in a NiagaraSystem file
+    /// </summary>
+    public static string EditFloatCurve(FloatCurveEditRequest request, string? usmapPath = null)
+    {
+        var result = new ColorEditResult { Path = request.AssetPath };
+
+        try
+        {
+            if (!File.Exists(request.AssetPath))
+            {
+                result.Success = false;
+                result.Error = $"File not found: {request.AssetPath}";
+                return JsonSerializer.Serialize(result, JsonOptions);
+            }
+
+            Usmap? mappings = LoadMappings(usmapPath);
+            var asset = new UAsset(request.AssetPath, EngineVersion.VER_UE5_3, mappings);
+
+            int modifiedCount = 0;
+
+            for (int exportIdx = 0; exportIdx < asset.Exports.Count; exportIdx++)
+            {
+                if (request.ExportIndex.HasValue && request.ExportIndex.Value != exportIdx)
+                    continue;
+
+                var export = asset.Exports[exportIdx];
+                string exportName = export.ObjectName?.Value?.Value ?? "";
+                string className = export.GetExportClassType()?.Value?.Value ?? "";
+
+                if (!string.IsNullOrEmpty(request.ExportNameFilter))
+                {
+                    if (!exportName.Contains(request.ExportNameFilter, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
+
+                // Handle structured export
+                if (export is NiagaraDataInterfaceCurveExport floatCurveExport && floatCurveExport.ShaderLUT != null)
+                {
+                    for (int i = 0; i < floatCurveExport.ShaderLUT.Values.Count; i++)
+                    {
+                        if (request.ValueIndex.HasValue && request.ValueIndex.Value != i)
+                            continue;
+                        if (request.ValueIndexStart.HasValue && i < request.ValueIndexStart.Value)
+                            continue;
+                        if (request.ValueIndexEnd.HasValue && i > request.ValueIndexEnd.Value)
+                            continue;
+
+                        floatCurveExport.SetValue(i, request.Value);
+                        modifiedCount++;
+                    }
+                }
+                // Fallback for unrecognized types
+                else if (className.Contains("DataInterfaceCurve") && !className.Contains("Color") && !className.Contains("Vector") && export is NormalExport normalExport)
+                {
+                    modifiedCount += ModifyFloatShaderLUT(normalExport.Data, request.Value, request.ValueIndex, request.ValueIndexStart, request.ValueIndexEnd);
+                }
+            }
+
+            if (modifiedCount > 0)
+            {
+                asset.Write(request.AssetPath);
+            }
+
+            result.Success = true;
+            result.ModifiedCount = modifiedCount;
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return JsonSerializer.Serialize(result, JsonOptions);
+    }
+
+    /// <summary>
+    /// Edit Vector2D curve values in a NiagaraSystem file
+    /// </summary>
+    public static string EditVector2DCurve(Vector2DCurveEditRequest request, string? usmapPath = null)
+    {
+        var result = new ColorEditResult { Path = request.AssetPath };
+
+        try
+        {
+            if (!File.Exists(request.AssetPath))
+            {
+                result.Success = false;
+                result.Error = $"File not found: {request.AssetPath}";
+                return JsonSerializer.Serialize(result, JsonOptions);
+            }
+
+            Usmap? mappings = LoadMappings(usmapPath);
+            var asset = new UAsset(request.AssetPath, EngineVersion.VER_UE5_3, mappings);
+
+            bool modifyX = request.ModifyX ?? true;
+            bool modifyY = request.ModifyY ?? true;
+            int modifiedCount = 0;
+
+            for (int exportIdx = 0; exportIdx < asset.Exports.Count; exportIdx++)
+            {
+                if (request.ExportIndex.HasValue && request.ExportIndex.Value != exportIdx)
+                    continue;
+
+                var export = asset.Exports[exportIdx];
+                string exportName = export.ObjectName?.Value?.Value ?? "";
+                string className = export.GetExportClassType()?.Value?.Value ?? "";
+
+                if (!string.IsNullOrEmpty(request.ExportNameFilter))
+                {
+                    if (!exportName.Contains(request.ExportNameFilter, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
+
+                // Handle structured export
+                if (export is NiagaraDataInterfaceVector2DCurveExport vec2CurveExport && vec2CurveExport.ShaderLUT != null)
+                {
+                    for (int i = 0; i < vec2CurveExport.ShaderLUT.Values.Count; i++)
+                    {
+                        if (request.ValueIndex.HasValue && request.ValueIndex.Value != i)
+                            continue;
+                        if (request.ValueIndexStart.HasValue && i < request.ValueIndexStart.Value)
+                            continue;
+                        if (request.ValueIndexEnd.HasValue && i > request.ValueIndexEnd.Value)
+                            continue;
+
+                        var current = vec2CurveExport.ShaderLUT.Values[i];
+                        float newX = modifyX ? request.X : current.X;
+                        float newY = modifyY ? request.Y : current.Y;
+                        vec2CurveExport.SetValue(i, newX, newY);
+                        modifiedCount++;
+                    }
+                }
+                // Fallback for unrecognized types
+                else if (className.Contains("Vector2DCurve") && export is NormalExport normalExport)
+                {
+                    modifiedCount += ModifyVector2DShaderLUT(normalExport.Data, request.X, request.Y, request.ValueIndex, request.ValueIndexStart, request.ValueIndexEnd, modifyX, modifyY);
+                }
+            }
+
+            if (modifiedCount > 0)
+            {
+                asset.Write(request.AssetPath);
+            }
+
+            result.Success = true;
+            result.ModifiedCount = modifiedCount;
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+
+        return JsonSerializer.Serialize(result, JsonOptions);
+    }
+
     #endregion
 
     #region Helper Methods
@@ -467,6 +1050,152 @@ public static class NiagaraService
         }
 
         return colors;
+    }
+
+    private static List<FloatValue> ExtractFloatsFromExport(NormalExport export)
+    {
+        var values = new List<FloatValue>();
+        if (export.Data == null) return values;
+
+        foreach (var prop in export.Data)
+        {
+            if (prop.Name?.Value?.Value != "ShaderLUT") continue;
+            if (prop is not ArrayPropertyData lutArray) continue;
+
+            for (int i = 0; i < lutArray.Value.Length; i++)
+            {
+                if (lutArray.Value[i] is FloatPropertyData floatProp)
+                {
+                    values.Add(new FloatValue
+                    {
+                        Index = i,
+                        Value = floatProp.Value
+                    });
+                }
+            }
+        }
+
+        return values;
+    }
+
+    private static List<Vector2DValue> ExtractVector2DsFromExport(NormalExport export)
+    {
+        var values = new List<Vector2DValue>();
+        if (export.Data == null) return values;
+
+        foreach (var prop in export.Data)
+        {
+            if (prop.Name?.Value?.Value != "ShaderLUT") continue;
+            if (prop is not ArrayPropertyData lutArray) continue;
+
+            for (int i = 0; i + 1 < lutArray.Value.Length; i += 2)
+            {
+                if (lutArray.Value[i] is FloatPropertyData xProp &&
+                    lutArray.Value[i + 1] is FloatPropertyData yProp)
+                {
+                    values.Add(new Vector2DValue
+                    {
+                        Index = i / 2,
+                        X = xProp.Value,
+                        Y = yProp.Value
+                    });
+                }
+            }
+        }
+
+        return values;
+    }
+
+    private static List<Vector3Value> ExtractVector3sFromExport(NormalExport export)
+    {
+        var values = new List<Vector3Value>();
+        if (export.Data == null) return values;
+
+        foreach (var prop in export.Data)
+        {
+            if (prop.Name?.Value?.Value != "ShaderLUT") continue;
+            if (prop is not ArrayPropertyData lutArray) continue;
+
+            for (int i = 0; i + 2 < lutArray.Value.Length; i += 3)
+            {
+                if (lutArray.Value[i] is FloatPropertyData xProp &&
+                    lutArray.Value[i + 1] is FloatPropertyData yProp &&
+                    lutArray.Value[i + 2] is FloatPropertyData zProp)
+                {
+                    values.Add(new Vector3Value
+                    {
+                        Index = i / 3,
+                        X = xProp.Value,
+                        Y = yProp.Value,
+                        Z = zProp.Value
+                    });
+                }
+            }
+        }
+
+        return values;
+    }
+
+    private static int ModifyFloatShaderLUT(List<PropertyData> properties, float value, int? specificIndex, int? indexStart, int? indexEnd)
+    {
+        int count = 0;
+
+        foreach (var prop in properties)
+        {
+            if (prop.Name?.Value?.Value != "ShaderLUT") continue;
+            if (prop is not ArrayPropertyData lutArray) continue;
+
+            for (int i = 0; i < lutArray.Value.Length; i++)
+            {
+                if (specificIndex.HasValue && specificIndex.Value != i)
+                    continue;
+                if (indexStart.HasValue && i < indexStart.Value)
+                    continue;
+                if (indexEnd.HasValue && i > indexEnd.Value)
+                    continue;
+
+                if (lutArray.Value[i] is FloatPropertyData floatProp)
+                {
+                    floatProp.Value = value;
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    private static int ModifyVector2DShaderLUT(List<PropertyData> properties, float x, float y, int? specificIndex, int? indexStart, int? indexEnd, bool modifyX, bool modifyY)
+    {
+        int count = 0;
+
+        foreach (var prop in properties)
+        {
+            if (prop.Name?.Value?.Value != "ShaderLUT") continue;
+            if (prop is not ArrayPropertyData lutArray) continue;
+
+            for (int i = 0; i + 1 < lutArray.Value.Length; i += 2)
+            {
+                int vecIndex = i / 2;
+
+                if (specificIndex.HasValue && specificIndex.Value != vecIndex)
+                    continue;
+                if (indexStart.HasValue && vecIndex < indexStart.Value)
+                    continue;
+                if (indexEnd.HasValue && vecIndex > indexEnd.Value)
+                    continue;
+
+                if (lutArray.Value[i] is FloatPropertyData xProp &&
+                    lutArray.Value[i + 1] is FloatPropertyData yProp)
+                {
+                    if (modifyX) xProp.Value = x;
+                    if (modifyY) yProp.Value = y;
+                    count++;
+                }
+            }
+        }
+
+        return count;
     }
 
     private static int ModifyShaderLUT(List<PropertyData> properties, FLinearColor targetColor, int? specificColorIndex = null)

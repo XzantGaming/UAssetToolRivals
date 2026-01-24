@@ -132,6 +132,163 @@ namespace UAssetAPI.ExportTypes
     }
 
     /// <summary>
+    /// A single float value entry in a ShaderLUT for NiagaraDataInterfaceCurve.
+    /// Stored as a single float in the flat array.
+    /// </summary>
+    public struct FShaderLUTFloat
+    {
+        public float Value;
+
+        public FShaderLUTFloat(float value)
+        {
+            Value = value;
+        }
+
+        public static int SerializedSize => 4; // 4 bytes
+
+        public override string ToString() => $"{Value:F3}";
+    }
+
+    /// <summary>
+    /// A single Vector2D entry in a ShaderLUT for NiagaraDataInterfaceVector2DCurve.
+    /// Stored as 2 consecutive floats (X, Y) in the flat array.
+    /// </summary>
+    public struct FShaderLUTVector2D
+    {
+        public float X;
+        public float Y;
+
+        public FShaderLUTVector2D(float x, float y)
+        {
+            X = x;
+            Y = y;
+        }
+
+        public static int SerializedSize => 2 * 4; // 8 bytes
+
+        public override string ToString() => $"({X:F3}, {Y:F3})";
+    }
+
+    /// <summary>
+    /// ShaderLUT for NiagaraDataInterfaceCurve - contains float values.
+    /// Used for single-channel curves like scale, opacity, speed, etc.
+    /// </summary>
+    public class FShaderLUTFloats
+    {
+        public List<FShaderLUTFloat> Values { get; set; }
+
+        public FShaderLUTFloats()
+        {
+            Values = new List<FShaderLUTFloat>();
+        }
+
+        public int FloatCount => Values.Count;
+
+        public void SetAllValues(float value)
+        {
+            for (int i = 0; i < Values.Count; i++)
+            {
+                Values[i] = new FShaderLUTFloat(value);
+            }
+        }
+
+        public void SetValue(int index, float value)
+        {
+            if (index >= 0 && index < Values.Count)
+            {
+                Values[index] = new FShaderLUTFloat(value);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A single Vector3 entry in a ShaderLUT for NiagaraDataInterfaceVectorCurve.
+    /// Stored as 3 consecutive floats (X, Y, Z) in the flat array.
+    /// Can represent RGB colors or 3D positions/directions.
+    /// </summary>
+    public struct FShaderLUTVector3
+    {
+        public float X;
+        public float Y;
+        public float Z;
+
+        public FShaderLUTVector3(float x, float y, float z)
+        {
+            X = x;
+            Y = y;
+            Z = z;
+        }
+
+        public static int SerializedSize => 3 * 4; // 12 bytes
+
+        public override string ToString() => $"({X:F3}, {Y:F3}, {Z:F3})";
+    }
+
+    /// <summary>
+    /// ShaderLUT for NiagaraDataInterfaceVectorCurve - contains Vector3 values.
+    /// Used for 3D curves like RGB colors, positions, directions, etc.
+    /// </summary>
+    public class FShaderLUTVector3s
+    {
+        public List<FShaderLUTVector3> Values { get; set; }
+
+        public FShaderLUTVector3s()
+        {
+            Values = new List<FShaderLUTVector3>();
+        }
+
+        public int FloatCount => Values.Count * 3;
+
+        public void SetAllValues(float x, float y, float z)
+        {
+            for (int i = 0; i < Values.Count; i++)
+            {
+                Values[i] = new FShaderLUTVector3(x, y, z);
+            }
+        }
+
+        public void SetValue(int index, float x, float y, float z)
+        {
+            if (index >= 0 && index < Values.Count)
+            {
+                Values[index] = new FShaderLUTVector3(x, y, z);
+            }
+        }
+    }
+
+    /// <summary>
+    /// ShaderLUT for NiagaraDataInterfaceVector2DCurve - contains Vector2D values.
+    /// Used for 2D curves like UV offsets, 2D positions, etc.
+    /// </summary>
+    public class FShaderLUTVector2Ds
+    {
+        public List<FShaderLUTVector2D> Values { get; set; }
+
+        public FShaderLUTVector2Ds()
+        {
+            Values = new List<FShaderLUTVector2D>();
+        }
+
+        public int FloatCount => Values.Count * 2;
+
+        public void SetAllValues(float x, float y)
+        {
+            for (int i = 0; i < Values.Count; i++)
+            {
+                Values[i] = new FShaderLUTVector2D(x, y);
+            }
+        }
+
+        public void SetValue(int index, float x, float y)
+        {
+            if (index >= 0 && index < Values.Count)
+            {
+                Values[index] = new FShaderLUTVector2D(x, y);
+            }
+        }
+    }
+
+    /// <summary>
     /// Curve key for FRichCurve (used in Niagara curves before baking to ShaderLUT).
     /// </summary>
     public struct FRichCurveKey

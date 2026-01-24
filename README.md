@@ -329,18 +329,30 @@ UAssetTool niagara_edit asset.uasset 0 10 0 1 --export-name Color --color-range 
 ```json
 {
   "success": true,
-  "totalExports": 89,
-  "colorCurveCount": 20,
+  "totalExports": 269,
+  "colorCurveCount": 12,
+  "totalColorCount": 1536,
   "colorCurves": [
-    {
-      "exportIndex": 0,
-      "exportName": "NiagaraDataInterfaceColorCurve",
-      "colorCount": 128,
-      "sampleColors": [
-        {"index": 0, "r": 1.5, "g": 0.2, "b": 2.0, "a": 1}
-      ]
-    }
-  ]
+    {"exportIndex": 0, "exportName": "NiagaraDataInterfaceColorCurve", "colorCount": 128, "sampleColors": [...]}
+  ],
+  "floatCurveCount": 40,
+  "totalFloatCount": 2120,
+  "floatCurves": [
+    {"exportIndex": 31, "exportName": "NiagaraDataInterfaceCurve", "valueCount": 106, "sampleValues": [...]}
+  ],
+  "vector3CurveCount": 8,
+  "totalVector3Count": 1024,
+  "vector3Curves": [
+    {"exportIndex": 22, "exportName": "NiagaraDataInterfaceVectorCurve", "valueCount": 128, "sampleValues": [...]}
+  ],
+  "arrayColorCount": 4,
+  "totalArrayColorValues": 12,
+  "arrayColors": [
+    {"exportIndex": 0, "exportName": "NiagaraDataInterfaceArrayColor", "colorCount": 3, "sampleColors": [...]}
+  ],
+  "arrayFloatCount": 10,
+  "totalArrayFloatValues": 30,
+  "arrayFloats": [...]
 }
 ```
 
