@@ -1355,9 +1355,15 @@ public partial class Program
                         relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
                         if (!relPath.StartsWith("/"))
                             relPath = "/" + relPath;
+                        // The resolved path is like /Marvel/Content/Marvel/Characters/...
+                        // /Marvel/Content is the game root (= /Game), so extract everything after it
+                        // Result should be /Game/Marvel/Characters/...
+                        int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+                        if (contentIdx >= 0)
+                            relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
                     }
                     
-                    // Remove leading slash and /Game/ prefix, keep the rest (e.g., Marvel/Content/Marvel/...)
+                    // Remove /Game/ prefix to get relative path (e.g., Content/Marvel/...)
                     if (relPath.StartsWith("/Game/"))
                         relPath = relPath.Substring(6); // Remove "/Game/"
                     else if (relPath.StartsWith("/"))
