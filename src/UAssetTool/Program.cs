@@ -1681,6 +1681,7 @@ public partial class Program
                     }
 
                     var asset = LoadAsset(file, usmapPath);
+                    PreloadReferencedAssetsForSchemas(asset);
                     string json = asset.SerializeJson(true);
                     File.WriteAllText(jsonOutputPath, json, System.Text.Encoding.UTF8);
                     Console.WriteLine($"Converted: {file} -> {jsonOutputPath}");
@@ -1712,6 +1713,7 @@ public partial class Program
                 }
 
                 var asset = LoadAsset(inputPath, usmapPath);
+                PreloadReferencedAssetsForSchemas(asset);
                 string json = asset.SerializeJson(true);
                 File.WriteAllText(jsonOutputPath, json, System.Text.Encoding.UTF8);
                 Console.WriteLine($"Asset exported to JSON: {jsonOutputPath}");
@@ -3855,6 +3857,72 @@ public partial class Program
         asset.UseSeparateBulkDataFiles = true;
         Console.Error.WriteLine($"[UAssetTool] Asset loaded: HasUnversionedProperties={asset.HasUnversionedProperties}, Exports={asset.Exports?.Count ?? 0}");
         return asset;
+    }
+    
+    /// <summary>
+    /// Pre-load all referenced assets to populate schema cache for proper JSON serialization.
+    /// This fixes the "Failed to find a valid schema for parent name" error when converting
+    /// Blueprint assets that inherit from classes defined in other asset files.
+    /// </summary>
+    private static void PreloadReferencedAssetsForSchemas(UAsset asset)
+    {
+        if (asset.Mappings == null || asset.Imports == null) return;
+        
+        int loadedCount = 0;
+        var processedPaths = new HashSet<string>();
+        
+        // Iterate through all imports and try to load referenced assets
+        foreach (var import in asset.Imports)
+        {
+            // Skip script imports (native classes)
+            if (import.ClassPackage?.Value?.Value?.StartsWith("/Script") == true) continue;
+            
+            // Get the package path from the outer chain
+            FName? packagePath = null;
+            if (import.OuterIndex.IsImport())
+            {
+                var outer = import.OuterIndex.ToImport(asset);
+                // Walk up the outer chain to find the package
+                while (outer != null)
+                {
+                    if (outer.OuterIndex.Index == 0)
+                    {
+                        // This is the package
+                        packagePath = outer.ObjectName;
+                        break;
+                    }
+                    else if (outer.OuterIndex.IsImport())
+                    {
+                        outer = outer.OuterIndex.ToImport(asset);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+            
+            if (packagePath != null && !processedPaths.Contains(packagePath.Value.Value))
+            {
+                processedPaths.Add(packagePath.Value.Value);
+                
+                // Try to load the referenced asset
+                if (asset.PullSchemasFromAnotherAsset(packagePath, import.ObjectName))
+                {
+                    loadedCount++;
+                }
+            }
+        }
+        
+        if (loadedCount > 0)
+        {
+            Console.Error.WriteLine($"[UAssetTool] Pre-loaded {loadedCount} referenced assets for schema resolution");
+        }
+        
+        if (asset.OtherAssetsFailedToAccess.Count > 0)
+        {
+            Console.Error.WriteLine($"[UAssetTool] Warning: Could not find {asset.OtherAssetsFailedToAccess.Count} referenced assets on disk");
+        }
     }
     
     private static Usmap? LoadMappings(string? usmapPath)
