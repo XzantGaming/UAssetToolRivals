@@ -898,77 +898,40 @@ public class ZenToLegacyConverter
     /// </summary>
     private byte[] RebuildExportDataFromBundles()
     {
-        int headerSize = (int)_zenPackage.Summary.HeaderSize;
+        int zenHeaderSize = (int)_zenPackage.Summary.HeaderSize;
         
         // Calculate total export serial size
         long totalExportSerialSize = 0;
         foreach (var export in _builder.Exports)
             totalExportSerialSize += export.SerialSize;
         
+        // We need the legacy header size to convert SerialOffset (which includes
+        // the legacy header size) back to a position within the .uexp buffer.
+        long legacyHeaderSize = 0;
+        if (_builder.Exports.Count > 0)
+        {
+            legacyHeaderSize = _builder.Exports.Min(e => e.SerialOffset);
+        }
+        
         // Allocate result buffer: exports + PACKAGE_FILE_TAG footer
         int totalFileSize = (int)totalExportSerialSize + 4;
         byte[] result = new byte[totalFileSize];
         
-        int endOfLastExportBundle = 0;
-        int currentPackageOffset = headerSize; // For legacy UE4.27 packages
-        
-        for (int bundleIndex = 0; bundleIndex < _zenPackage.ExportBundleHeaders.Count; bundleIndex++)
+        // Use CookedSerialOffset from each export map entry directly.
+        // CookedSerialOffset is relative to the start of export data (after zen header).
+        // Each export's data in the .uexp is placed at its sequential position
+        // (determined by SerialOffset - legacyHeaderSize).
+        for (int i = 0; i < _zenPackage.ExportMap.Count && i < _builder.Exports.Count; i++)
         {
-            var bundleHeader = _zenPackage.ExportBundleHeaders[bundleIndex];
+            var zenExport = _zenPackage.ExportMap[i];
+            long sourceOffset = zenHeaderSize + (long)zenExport.CookedSerialOffset;
+            int exportSerialSize = (int)_builder.Exports[i].SerialSize;
+            long targetOffset = _builder.Exports[i].SerialOffset - legacyHeaderSize;
             
-            // Determine the starting serial offset for this bundle
-            int currentSerialOffset;
-            if (bundleHeader.SerialOffset != ulong.MaxValue)
+            if (sourceOffset >= 0 && sourceOffset + exportSerialSize <= _rawPackageData.Length &&
+                targetOffset >= 0 && targetOffset + exportSerialSize <= totalExportSerialSize)
             {
-                // UE5.0+: explicit serial offset relative to header
-                currentSerialOffset = headerSize + (int)bundleHeader.SerialOffset;
-            }
-            else
-            {
-                // Legacy UE4.27: sequential from current position
-                currentSerialOffset = currentPackageOffset;
-            }
-            
-            for (uint i = 0; i < bundleHeader.EntryCount; i++)
-            {
-                int entryIndex = (int)bundleHeader.FirstEntryIndex + (int)i;
-                if (entryIndex >= _zenPackage.ExportBundleEntries.Count) break;
-                
-                var bundleEntry = _zenPackage.ExportBundleEntries[entryIndex];
-                
-                // Only Serialize commands encode export data blobs
-                if (bundleEntry.CommandType == EExportCommandType.Serialize)
-                {
-                    int exportIndex = (int)bundleEntry.LocalExportIndex;
-                    if (exportIndex >= _builder.Exports.Count) continue;
-                    
-                    int exportSerialSize = (int)_builder.Exports[exportIndex].SerialSize;
-                    long exportTargetOffset = _builder.Exports[exportIndex].SerialOffset;
-                    
-                    int sourceStart = currentSerialOffset;
-                    int sourceEnd = sourceStart + exportSerialSize;
-                    
-                    // Bounds check
-                    if (sourceEnd <= _rawPackageData.Length && exportTargetOffset + exportSerialSize <= totalExportSerialSize)
-                    {
-                        Array.Copy(_rawPackageData, sourceStart, result, (int)exportTargetOffset, exportSerialSize);
-                    }
-                    
-                    currentSerialOffset += exportSerialSize;
-                }
-            }
-            
-            endOfLastExportBundle = Math.Max(endOfLastExportBundle, currentSerialOffset);
-            currentPackageOffset = currentSerialOffset;
-        }
-        
-        // Copy any additional data past the last export bundle (rare but handle it)
-        if (endOfLastExportBundle < _rawPackageData.Length)
-        {
-            int additionalDataLength = _rawPackageData.Length - endOfLastExportBundle;
-            if (additionalDataLength > 0 && (int)totalExportSerialSize + additionalDataLength <= result.Length - 4)
-            {
-                Array.Copy(_rawPackageData, endOfLastExportBundle, result, (int)totalExportSerialSize, additionalDataLength);
+                Array.Copy(_rawPackageData, sourceOffset, result, (int)targetOffset, exportSerialSize);
             }
         }
         
