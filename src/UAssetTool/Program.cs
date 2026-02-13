@@ -1731,6 +1731,12 @@ public partial class Program
         
         asset.Mappings = mappings;
         
+        // Set FilePath so FindAssetOnDiskFromPath can locate sibling assets for schema resolution
+        asset.FilePath = Path.GetFullPath(outputPath);
+        
+        // Preload schemas from referenced assets (parent BPs etc.) - same as CliToJson
+        PreloadReferencedAssetsForSchemas(asset);
+        
         // Ensure output directory exists
         string? outputDir = Path.GetDirectoryName(outputPath);
         if (!string.IsNullOrEmpty(outputDir))
