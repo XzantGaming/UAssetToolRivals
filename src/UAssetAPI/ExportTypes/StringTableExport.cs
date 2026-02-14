@@ -77,50 +77,53 @@ namespace UAssetAPI.ExportTypes
             Table = new FStringTable(reader.ReadFString());
 
             int numEntries = reader.ReadInt32();
+            long posBeforeEntries = reader.BaseStream.Position;
 
-            // Read all Key/Value pairs first (standard UE5 format)
+            // Try reading with interleaved FGameplayTagContainers (Marvel Rivals format):
+            // [Key, Value, Tags] per entry, then trailing Tags
+            bool hasGameplayTags = false;
             var keys = new List<FString>(numEntries);
             var values = new List<FString>(numEntries);
 
-            for (int i = 0; i < numEntries; i++)
+            try
             {
-                keys.Add(reader.ReadFString());
-                values.Add(reader.ReadFString());
+                var trialKeys = new List<FString>(numEntries);
+                var trialValues = new List<FString>(numEntries);
+                var trialTags = new List<FGameplayTagContainer>(numEntries);
+
+                for (int i = 0; i < numEntries; i++)
+                {
+                    trialKeys.Add(reader.ReadFString());
+                    trialValues.Add(reader.ReadFString());
+                    trialTags.Add(new FGameplayTagContainer(reader));
+                }
+                var trialTrailing = new FGameplayTagContainer(reader);
+
+                if (reader.BaseStream.Position == nextStarting)
+                {
+                    hasGameplayTags = true;
+                    keys = trialKeys;
+                    values = trialValues;
+                    Table.EntryGameplayTags = trialTags;
+                    Table.TrailingTagContainer = trialTrailing;
+                }
+            }
+            catch
+            {
+                // Interleaved tag reading failed
             }
 
-            long posAfterEntries = reader.BaseStream.Position;
-            long remainingBytes = nextStarting - posAfterEntries;
-
-            // Detect if FGameplayTagContainers follow (Marvel Rivals extension).
-            // Strategy: try to read all (numEntries + 1) tag containers from the
-            // current position. If we land exactly at nextStarting, the tags are real.
-            bool hasGameplayTags = false;
-            if (remainingBytes >= (numEntries + 1) * 4L && remainingBytes > 0)
+            // Fall back to standard UE5 format: [Key, Value] per entry, no tags
+            if (!hasGameplayTags)
             {
-                try
-                {
-                    var trialTags = new List<FGameplayTagContainer>(numEntries);
-                    for (int i = 0; i < numEntries; i++)
-                    {
-                        trialTags.Add(new FGameplayTagContainer(reader));
-                    }
-                    var trialTrailing = new FGameplayTagContainer(reader);
+                reader.BaseStream.Position = posBeforeEntries;
+                keys.Clear();
+                values.Clear();
 
-                    if (reader.BaseStream.Position == nextStarting)
-                    {
-                        hasGameplayTags = true;
-                        Table.EntryGameplayTags = trialTags;
-                        Table.TrailingTagContainer = trialTrailing;
-                    }
-                }
-                catch
+                for (int i = 0; i < numEntries; i++)
                 {
-                    // Reading tags failed — not gameplay tag data
-                }
-
-                if (!hasGameplayTags)
-                {
-                    reader.BaseStream.Position = posAfterEntries;
+                    keys.Add(reader.ReadFString());
+                    values.Add(reader.ReadFString());
                 }
             }
 
@@ -130,7 +133,7 @@ namespace UAssetAPI.ExportTypes
             for (int i = 0; i < numEntries; i++)
             {
                 var key = keys[i];
-                if (key == null) continue; // skip null keys
+                if (key == null) continue;
                 if (Table.ContainsKey(key))
                     Table[key] = values[i];
                 else
