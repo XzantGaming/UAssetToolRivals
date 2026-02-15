@@ -5040,9 +5040,9 @@ public partial class Program
                 }
             }
             
-            // Load the target mod container
+            // Load the target mod container with priority so it overrides game packages
             int modContainerIndex = context.ContainerCount;
-            context.LoadContainer(utocPath);
+            context.LoadContainerWithPriority(utocPath);
             
             int converted = 0;
             int failed = 0;
