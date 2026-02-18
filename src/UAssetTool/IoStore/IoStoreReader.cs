@@ -515,27 +515,66 @@ public class IoStoreToc
                 {
                     // Read the raw directory index data
                     byte[] directoryData = reader.ReadBytes((int)directoryIndexSize);
+                    byte[] originalData = (byte[])directoryData.Clone();
                     
-                    // Preserve raw bytes for recompression pass-through
-                    // (before decryption — if encrypted, store the decrypted version)
+                    bool parsed = false;
                     
-                    // Decrypt if needed
-                    if (toc.IsEncrypted && toc.CanDecrypt)
+                    // For obfuscated containers: the Encrypted flag is set but the directory
+                    // index is NOT actually encrypted. This blocks FModel (which checks GUID
+                    // before trying keys) but we can read it by trying raw data first.
+                    // Try raw (unencrypted) first, then fall back to decryption.
+                    
+                    // Try 1: Parse raw data directly (handles obfuscated containers)
+                    try
                     {
-                        DecryptAes(directoryData, toc.AesKey!);
-                        if (Environment.GetEnvironmentVariable("DEBUG") == "1")
-                            Console.Error.WriteLine($"[TOC] Decrypted directory index");
+                        using var dirStream = new MemoryStream(originalData);
+                        using var dirReader = new BinaryReader(dirStream);
+                        ReadDirectoryIndex(dirReader, toc, directoryIndexSize);
+                        
+                        if (toc.FileMapRev.Count > 0)
+                        {
+                            toc.RawDirectoryIndex = (byte[])originalData.Clone();
+                            parsed = true;
+                            if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                                Console.Error.WriteLine($"[TOC] Raw directory index parsed: {toc.FileMapRev.Count} file paths");
+                        }
+                    }
+                    catch
+                    {
+                        // Raw parse failed, will try decryption below
                     }
                     
-                    // Store decrypted raw bytes for recompression pass-through
-                    toc.RawDirectoryIndex = (byte[])directoryData.Clone();
+                    // Try 2: Decrypt and parse (handles properly encrypted containers)
+                    if (!parsed && toc.IsEncrypted && toc.CanDecrypt)
+                    {
+                        try
+                        {
+                            toc.FileMapRev.Clear();
+                            
+                            byte[] decryptedData = (byte[])originalData.Clone();
+                            DecryptAes(decryptedData, toc.AesKey!);
+                            
+                            using var dirStream = new MemoryStream(decryptedData);
+                            using var dirReader = new BinaryReader(dirStream);
+                            ReadDirectoryIndex(dirReader, toc, directoryIndexSize);
+                            
+                            if (toc.FileMapRev.Count > 0)
+                            {
+                                toc.RawDirectoryIndex = (byte[])decryptedData.Clone();
+                                parsed = true;
+                                if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                                    Console.Error.WriteLine($"[TOC] Decrypted directory index parsed: {toc.FileMapRev.Count} file paths");
+                            }
+                        }
+                        catch
+                        {
+                            if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                                Console.Error.WriteLine($"[TOC] Decrypted parse also failed");
+                        }
+                    }
                     
-                    // Parse the decrypted directory index
-                    using var dirStream = new MemoryStream(directoryData);
-                    using var dirReader = new BinaryReader(dirStream);
-                    ReadDirectoryIndex(dirReader, toc, directoryIndexSize);
-                    if (Environment.GetEnvironmentVariable("DEBUG") == "1")
-                        Console.Error.WriteLine($"[TOC] Directory index parsed: {toc.FileMapRev.Count} file paths");
+                    if (!parsed && Environment.GetEnvironmentVariable("DEBUG") == "1")
+                        Console.Error.WriteLine($"[TOC] Could not parse directory index");
                 }
                 catch (Exception ex)
                 {

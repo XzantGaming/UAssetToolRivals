@@ -419,6 +419,7 @@ public class IoStoreWriter : IDisposable
         }
 
         // Write directory index (BEFORE chunk metas - per Rust implementation)
+        // Note: directoryIndexData is already encrypted if _enableEncryption is true (done above)
         writer.Write(directoryIndexData);
 
         // Write chunk metas (AFTER directory index)
