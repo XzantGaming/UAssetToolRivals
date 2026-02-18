@@ -85,6 +85,7 @@ public class IoStoreWriter : IDisposable
             _aesKey = new byte[32];
             for (int i = 0; i < 32; i++)
                 _aesKey[i] = Convert.ToByte(keyHex.Substring(i * 2, 2), 16);
+            // EncryptionKeyGuid stays as zeros - this blocks FModel but allows our tool to read
         }
 
         // Use provided container ID or generate from filename

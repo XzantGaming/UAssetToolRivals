@@ -436,7 +436,7 @@ public class PakWriter : IDisposable
     /// </summary>
     private static void WriteFooter(BinaryWriter writer, long indexOffset, ulong indexSize, byte[] indexHash)
     {
-        // Encryption key GUID (16 bytes) - all zeros for default key (footer.rs line 87-89)
+        // Encryption key GUID (16 bytes) - all zeros for obfuscation (footer.rs line 87-89)
         writer.Write(new byte[16]);
 
         // Is index encrypted (1 byte) (footer.rs line 90-92)
