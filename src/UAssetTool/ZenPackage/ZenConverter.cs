@@ -263,7 +263,8 @@ public class ZenConverter
                         int sizeDiff = reserializedData.Length - uexpData.Length;
                         // Verbose logging disabled for parallel performance
                         uexpData = reserializedData;
-                        materialPaddingToAdd = sizeDiff;
+                        // WriteData() already updated SerialSize on exports, so no extra padding needed.
+                        // materialPaddingToAdd stays 0 — SerialSize is already correct.
                         // WriteData() recalculates SerialOffset values based on a new header size.
                         headerSize = asset.Exports.Min(e => e.SerialOffset);
                     }
@@ -280,8 +281,17 @@ public class ZenConverter
         }
         else if (isStaticMesh)
         {
-            // StaticMesh doesn't need FGameplayTagContainer padding for Marvel Rivals
-            // Verbose logging disabled for parallel performance
+            // Marvel Rivals uses 16-byte ScreenSize entries (bCooked+Default+PerPlatformCount+PlatformValue)
+            // Default UE5 uses 8-byte entries (bCooked+Default). We must expand 64→128 bytes.
+            var patchedStaticMesh = PatchStaticMeshScreenSize(uexpData);
+            if (patchedStaticMesh != null)
+            {
+                int sizeDiff = patchedStaticMesh.Length - uexpData.Length;
+                uexpData = patchedStaticMesh;
+                materialPaddingToAdd = sizeDiff;
+                headerSize = asset.Exports.Min(e => e.SerialOffset);
+                Console.Error.WriteLine($"[ZenConverter] StaticMesh ScreenSize expanded: +{sizeDiff} bytes");
+            }
         }
         
         if (isStringTable)
@@ -297,14 +307,16 @@ public class ZenConverter
                 {
                     // Verbose logging disabled for parallel performance
                     uexpData = reserializedData;
-                    stringTablePaddingToAdd = sizeDiff;
+                    // WriteData() already updated SerialSize on exports, so no extra padding needed.
+                    // stringTablePaddingToAdd stays 0 — SerialSize is already correct.
+                    headerSize = asset.Exports.Min(e => e.SerialOffset);
                 }
             }
         }
         
-        // The padding is included in the re-serialized uexpData, but the export size calculation
-        // uses original SerialOffset values which don't account for the padding.
-        // Pass the padding amount so it can be added to the last export's size.
+        // materialPaddingToAdd is only set for binary-patched data (e.g. StaticMesh ScreenSize expansion)
+        // where SerialSize was NOT updated by WriteData(). For re-serialized data (SkeletalMesh, StringTable),
+        // WriteData() already updated SerialSize, so their padding stays 0.
         int totalPaddingToAdd = materialPaddingToAdd + stringTablePaddingToAdd;
 
         // Build Zen package
@@ -382,12 +394,13 @@ public class ZenConverter
             sizeOfOtherExports += size;
         }
         
-        // Last export: use SerialSize directly - it's updated by WriteData() after re-serialization
-        // The padding is already included in SerialSize
+        // Last export gets its original SerialSize plus any padding added by binary patching
+        // (e.g. StaticMesh ScreenSize expansion, SkeletalMesh FGameplayTagContainer padding)
+        // For re-serialized data (WriteData path), SerialSize is already updated by UAssetAPI.
         if (sortedByOffset.Count > 0)
         {
             var lastExport = sortedByOffset[sortedByOffset.Count - 1];
-            exportSizes[lastExport] = lastExport.SerialSize;
+            exportSizes[lastExport] = lastExport.SerialSize + materialPaddingToAdd;
         }
         
         // Keep original export order - reordering corrupts the data
@@ -1706,6 +1719,203 @@ public class ZenConverter
         }
     }
     
+    /// <summary>
+    /// Patch StaticMesh ScreenSize entries from standard UE5 format (8 bytes each, 64 total)
+    /// to Marvel Rivals format (16 bytes each, 128 total).
+    /// 
+    /// Standard UE5:     8 entries × (bCooked int32 + Default float) = 64 bytes
+    /// Marvel Rivals:    8 entries × (bCooked int32 + Default float + PerPlatformCount int32 + PlatformValue float) = 128 bytes
+    /// 
+    /// Detection strategy (validated across 182+ game meshes):
+    /// 1. Find material array near end (count + N × 36-byte FStaticMaterial)
+    /// 2. SpeedTree = 4 bytes before materials (always 0)
+    /// 3. ScreenSize = 64 or 128 bytes before SpeedTree
+    /// 4. Verify bLODsShareStaticLighting (0 or 1) before ScreenSize
+    /// </summary>
+    private static byte[]? PatchStaticMeshScreenSize(byte[] uexpData)
+    {
+        const int SCREEN_SIZE_ENTRIES = 8;
+        const int STANDARD_ENTRY_SIZE = 8;   // bCooked(4) + Default(4)
+        const int MARVEL_ENTRY_SIZE = 16;     // bCooked(4) + Default(4) + PerPlatformCount(4) + PlatformValue(4)
+        const int STANDARD_SCREEN_SIZE = SCREEN_SIZE_ENTRIES * STANDARD_ENTRY_SIZE;   // 64
+        const int MARVEL_SCREEN_SIZE = SCREEN_SIZE_ENTRIES * MARVEL_ENTRY_SIZE;        // 128
+        const int EXPANSION = MARVEL_SCREEN_SIZE - STANDARD_SCREEN_SIZE;              // 64
+        const int MATERIAL_STRUCT_SIZE = 36;
+        const int MAX_MATERIAL_COUNT = 50;
+        // Sentinel value for unused ScreenSize PlatformValue (0x55000000)
+        const uint SENTINEL_VALUE = 0x55000000;
+
+        int dataLen = uexpData.Length;
+
+        // Step 1: Find material array near end of file
+        // Materials can reference imports (negative) OR exports/null (0 or positive)
+        int matCountOffset = -1;
+        int matCount = 0;
+
+        for (int i = dataLen - 40; i > Math.Max(0, dataLen - 2000); i--)
+        {
+            int mc = BitConverter.ToInt32(uexpData, i);
+            if (mc < 1 || mc > MAX_MATERIAL_COUNT)
+                continue;
+
+            int expectedEnd = i + 4 + (mc * MATERIAL_STRUCT_SIZE);
+            if (Math.Abs(expectedEnd - dataLen) > 4)
+                continue;
+
+            // Verify first material has a reasonable FPackageIndex
+            int firstPkg = BitConverter.ToInt32(uexpData, i + 4);
+            // Allow negative (imports), zero (null/WorldGridMaterial), or small positive (exports)
+            if (firstPkg < -1000 || firstPkg > 1000)
+                continue;
+
+            // Verify FName index after FPackageIndex looks reasonable
+            int fnameIdx = BitConverter.ToInt32(uexpData, i + 8);
+            if (fnameIdx < 0 || fnameIdx > 10000)
+                continue;
+
+            matCountOffset = i;
+            matCount = mc;
+            break;
+        }
+
+        if (matCountOffset < 0)
+        {
+            Console.Error.WriteLine("[ZenConverter] StaticMesh: Could not locate material array");
+            return null;
+        }
+
+        // Step 2: SpeedTree is 4 bytes before material count
+        int speedTreeOffset = matCountOffset - 4;
+        if (speedTreeOffset < 0)
+            return null;
+
+        int speedTree = BitConverter.ToInt32(uexpData, speedTreeOffset);
+        // SpeedTree should be 0 (false) or 1 (true)
+        if (speedTree != 0 && speedTree != 1)
+        {
+            Console.Error.WriteLine($"[ZenConverter] StaticMesh: Unexpected SpeedTree value {speedTree} at 0x{speedTreeOffset:X}");
+            return null;
+        }
+
+        // Step 3: Check if ScreenSize is already Marvel Rivals format (128 bytes) or standard (64 bytes)
+        // Try Marvel Rivals format first (already expanded = no-op)
+        int marvelSSStart = speedTreeOffset - MARVEL_SCREEN_SIZE;
+        if (marvelSSStart >= 4)
+        {
+            bool isMarvelFormat = true;
+            for (int e = 0; e < SCREEN_SIZE_ENTRIES && isMarvelFormat; e++)
+            {
+                int off = marvelSSStart + e * MARVEL_ENTRY_SIZE;
+                int bCooked = BitConverter.ToInt32(uexpData, off);
+                int ppCount = BitConverter.ToInt32(uexpData, off + 8);
+                if (bCooked != 1 || ppCount != 1)
+                    isMarvelFormat = false;
+            }
+            if (isMarvelFormat)
+            {
+                int bLod = BitConverter.ToInt32(uexpData, marvelSSStart - 4);
+                if (bLod == 0 || bLod == 1)
+                {
+                    // Already in Marvel Rivals format — no expansion needed
+                    return null;
+                }
+            }
+        }
+
+        // Try standard UE5 format (64 bytes)
+        int stdSSStart = speedTreeOffset - STANDARD_SCREEN_SIZE;
+        if (stdSSStart < 4)
+        {
+            Console.Error.WriteLine("[ZenConverter] StaticMesh: Not enough data before SpeedTree for ScreenSize");
+            return null;
+        }
+
+        // Verify standard format: all 8 entries should have bCooked=1
+        bool isStandardFormat = true;
+        for (int e = 0; e < SCREEN_SIZE_ENTRIES; e++)
+        {
+            int off = stdSSStart + e * STANDARD_ENTRY_SIZE;
+            int bCooked = BitConverter.ToInt32(uexpData, off);
+            if (bCooked != 1)
+            {
+                isStandardFormat = false;
+                break;
+            }
+        }
+
+        if (!isStandardFormat)
+        {
+            Console.Error.WriteLine("[ZenConverter] StaticMesh: ScreenSize does not match standard UE5 format");
+            return null;
+        }
+
+        // Verify bLODsShareStaticLighting before ScreenSize
+        int bLodOffset = stdSSStart - 4;
+        int bLodVal = BitConverter.ToInt32(uexpData, bLodOffset);
+        if (bLodVal != 0 && bLodVal != 1)
+        {
+            Console.Error.WriteLine($"[ZenConverter] StaticMesh: bLODsShareStaticLighting={bLodVal} (expected 0 or 1)");
+            return null;
+        }
+
+        // Step 4: Expand ScreenSize from 64 to 128 bytes
+        byte[] newData = new byte[dataLen + EXPANSION];
+
+        // Copy everything before ScreenSize
+        Array.Copy(uexpData, 0, newData, 0, stdSSStart);
+
+        // Write expanded ScreenSize entries
+        int dstOff = stdSSStart;
+        for (int e = 0; e < SCREEN_SIZE_ENTRIES; e++)
+        {
+            int srcOff = stdSSStart + e * STANDARD_ENTRY_SIZE;
+            int bCooked = BitConverter.ToInt32(uexpData, srcOff);
+            float defaultVal = BitConverter.ToSingle(uexpData, srcOff + 4);
+
+            // bCooked (int32)
+            Array.Copy(BitConverter.GetBytes(bCooked), 0, newData, dstOff, 4);
+            dstOff += 4;
+
+            // Default (float)
+            Array.Copy(BitConverter.GetBytes(defaultVal), 0, newData, dstOff, 4);
+            dstOff += 4;
+
+            // PerPlatformCount (int32) - always 1
+            Array.Copy(BitConverter.GetBytes((int)1), 0, newData, dstOff, 4);
+            dstOff += 4;
+
+            // PlatformValue (float) - 0.0 for active LOD 0, sentinel for unused
+            if (e == 0 && defaultVal > 0)
+            {
+                // Active LOD 0 gets PlatformValue = 0.0
+                Array.Copy(BitConverter.GetBytes(0.0f), 0, newData, dstOff, 4);
+            }
+            else if (defaultVal > 0 && defaultVal < 100)
+            {
+                // Active LOD with screen size > 0 — use sentinel as safe default
+                // (game meshes use distance values here, but sentinel works for compatibility)
+                Array.Copy(BitConverter.GetBytes(SENTINEL_VALUE), 0, newData, dstOff, 4);
+            }
+            else
+            {
+                // Unused LOD — sentinel value
+                Array.Copy(BitConverter.GetBytes(SENTINEL_VALUE), 0, newData, dstOff, 4);
+            }
+            dstOff += 4;
+        }
+
+        // Copy everything after ScreenSize (SpeedTree + Materials + any remaining data)
+        int afterSS = stdSSStart + STANDARD_SCREEN_SIZE;
+        int remaining = dataLen - afterSS;
+        if (remaining > 0)
+        {
+            Array.Copy(uexpData, afterSS, newData, dstOff, remaining);
+        }
+
+        Console.Error.WriteLine($"[ZenConverter] StaticMesh ScreenSize: expanded {STANDARD_SCREEN_SIZE} -> {MARVEL_SCREEN_SIZE} bytes (+{EXPANSION}), matCount={matCount}");
+        return newData;
+    }
+
     /// <summary>
     /// Calculate how much padding will be needed for a StringTable.
     /// Each string table entry (Key + Value) needs 4 bytes (FGameplayTagContainer count=0).
