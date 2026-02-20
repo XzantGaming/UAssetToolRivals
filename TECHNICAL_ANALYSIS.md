@@ -1241,7 +1241,7 @@ The `MaterialTagPlugin` (UE 5.3 editor plugin) provides the authoring UI:
 
 ### Overview
 
-These fixes were identified by comparing our tool's output byte-for-byte against `retoc`'s output (which produces known-working in-game mods). All fixes apply to both `ZenConverter.cs` and `AnimBlueprintZenConverter.cs`.
+These fixes were identified by comparing our tool's output byte-for-byte against `retoc`'s output (which produces known-working in-game mods) and by round-trip testing extracted game assets.
 
 ### 1. CookedHeaderSize
 
@@ -1308,6 +1308,47 @@ foreach (var name in names)
 }
 ```
 
+### 6. FName Number Suffix in Import Paths (No Zero-Padding)
+
+When constructing import package paths and export paths for CityHash64 computation, FName Number suffixes must use UE5's `FName::ToString()` format: `_{Number-1}` with **no zero-padding**.
+
+```csharp
+// CORRECT: UE5 FName::ToString format
+parts.Add(baseName + "_" + (number - 1));  // e.g. "M_Weapon_VFX_0"
+
+// WRONG: D2 zero-padded format
+// parts.Add(baseName + "_" + (number - 1).ToString("D2"));  // e.g. "M_Weapon_VFX_00"
+```
+
+The D2 format caused CityHash64 mismatches between the legacy→Zen path (which hashed `_00`) and the Zen→Legacy path (which computed hash of `_0`), making import resolution fall back to `Export_0` with `ClassName=Object`.
+
+**Affected methods:** `GetImportPackagePath()`, `GetImportExportPath()` in `ZenConverter.cs`.
+
+### 7. Package Summary Name: FName Base + Number
+
+The Zen package summary `Name` field is an `FMappedName` that indexes into the NameMap. The game stores the **FName base name** (without numeric suffix) in the NameMap and uses `FMappedName.Number` to reconstruct the full name.
+
+```csharp
+// Example: asset "MI_102993_Trail_13_301"
+// NameMap contains: "MI_102993_Trail_13" (at index 44)
+// Summary.Name = FMappedName(Index=44, Number=302)  // 302 = 301 + 1
+// Reconstructed: "MI_102993_Trail_13" + "_" + (302-1) = "MI_102993_Trail_13_301"
+
+// CORRECT: use FName base + Number
+zenPackage.Summary.Name = new FMappedName(
+    (uint)zenPackage.PackageNameIndex,
+    zenPackage.PackageNameNumber);  // e.g. 302 for _301
+
+// WRONG: hardcoded Number=0
+// zenPackage.Summary.Name = new FMappedName((uint)zenPackage.PackageNameIndex, 0);
+```
+
+`BuildNameMap()` checks for the FName base name in the NameMap using the same zero-padding rules as `FName.FromStringFragments`: suffixes starting with `0` and length > 1 (e.g. `_002`) are treated as literal name parts, not numeric suffixes.
+
+### 8. NameMap Deduplication for Package Names
+
+The full package path (e.g. `/Game/Marvel/.../MI_102993_Trail_13_301`) must NOT be added as a new NameMap entry when the FName base name or full asset name already exists in the NameMap. Adding extra entries inflates `NamesReferencedFromExportDataCount` and causes round-trip mismatches.
+
 ### Verification Method
 
 ```bash
@@ -1323,6 +1364,24 @@ retoc unpack-raw retoc_output.utoc retoc_raw_chunks/
 
 # 4. Compare chunk-by-chunk
 # Check CookedHeaderSize, FilterFlags, ExportDataSize, PublicExportHash
+```
+
+### Round-Trip Verification
+
+```bash
+# 1. Extract assets from game
+UAssetTool extract_iostore_legacy "C:/Game/Paks" extracted --filter MI_MyAsset
+
+# 2. Convert to Zen and create IoStore
+UAssetTool create_mod_iostore roundtrip/mod extracted/path/to/MI_MyAsset.uasset
+
+# 3. Extract back with game context
+UAssetTool extract_iostore_legacy "C:/Game/Paks" roundtrip/out --mod roundtrip/mod.utoc --filter MI_MyAsset
+
+# 4. Compare JSON dumps
+UAssetTool to_json extracted/path/to/MI_MyAsset.uasset
+UAssetTool to_json roundtrip/out/path/to/MI_MyAsset.uasset
+# NameMap counts, import ObjectNames, and ClassNames should be identical
 ```
 
 ---
