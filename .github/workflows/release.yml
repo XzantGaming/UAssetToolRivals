@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            artifact: UAssetTool-win-x64
+            ext: .exe
+          - os: ubuntu-latest
+            rid: linux-x64
+            artifact: UAssetTool-linux-x64
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish
+        run: >
+          dotnet publish src/UAssetTool/UAssetTool.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o publish
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: publish/UAssetTool${{ matrix.ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: UAssetTool-win-x64
+          path: win-x64
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: UAssetTool-linux-x64
+          path: linux-x64
+
+      - name: Prepare release assets
+        run: |
+          cd win-x64 && zip -j ../UAssetTool-win-x64.zip UAssetTool.exe && cd ..
+          cd linux-x64 && chmod +x UAssetTool && tar czf ../UAssetTool-linux-x64.tar.gz UAssetTool && cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            UAssetTool-win-x64.zip
+            UAssetTool-linux-x64.tar.gz

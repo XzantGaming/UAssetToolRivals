@@ -240,6 +240,7 @@ public class ZenConverter
         
         int materialPaddingToAdd = 0;
         int stringTablePaddingToAdd = 0;
+        Dictionary<int, long>? navCollisionSizeOverrides = null;
         if (isSkeletalMesh && skeletalExport != null)
         {
                 // CRITICAL: If source already had FGameplayTagContainer (extracted from game),
@@ -281,6 +282,39 @@ public class ZenConverter
         }
         else if (isStaticMesh)
         {
+            // Step 0: Convert versioned → unversioned properties if needed.
+            // Marvel Rivals requires PKG_UnversionedProperties. Modder-cooked UE5 assets
+            // default to versioned tagged properties, which the game cannot parse.
+            if (!asset.HasUnversionedProperties && !string.IsNullOrEmpty(usmapPath))
+            {
+                Console.Error.WriteLine("[ZenConverter] SM: converting from versioned to unversioned properties");
+                // Must reload asset with full parsing (skipParsing: false) so that
+                // properties are parsed into structured PropertyData objects.
+                // Without full parsing, Write() just copies raw bytes unchanged.
+                var parsedAsset = LoadAsset(uassetPath, usmapPath, skipParsing: false);
+                parsedAsset.UseSeparateBulkDataFiles = true;
+                parsedAsset.PackageFlags |= EPackageFlags.PKG_UnversionedProperties;
+                var reserializedSM = ReserializeExportsInPlace(parsedAsset, headerSize);
+                if (reserializedSM != null)
+                {
+                    Console.Error.WriteLine($"[ZenConverter] SM: re-serialized with unversioned properties ({reserializedSM.Length} bytes, was {uexpData.Length})");
+                    uexpData = reserializedSM;
+                    asset = parsedAsset;
+                }
+                else
+                {
+                    Console.Error.WriteLine("[ZenConverter] WARNING: SM unversioned conversion failed, keeping versioned");
+                }
+            }
+
+            // Step 1: Calculate NavCollision CookedSerialSize overrides.
+            // Marvel Rivals' UNavCollision::Serialize reads only properties + 48 bytes of binary data,
+            // but standard UE5 writes additional collision geometry after that.
+            // Instead of trimming the data (which causes ACCESS_VIOLATION), we override
+            // CookedSerialSize so the game reads only what it expects.
+            navCollisionSizeOverrides = CalculateNavCollisionSizeOverrides(asset, uexpData, headerSize);
+
+            // Step 2: Expand ScreenSize from standard UE5 format (64 bytes) to Marvel Rivals format (128 bytes).
             // Marvel Rivals uses 16-byte ScreenSize entries (bCooked+Default+PerPlatformCount+PlatformValue)
             // Default UE5 uses 8-byte entries (bCooked+Default). We must expand 64→128 bytes.
             var patchedStaticMesh = PatchStaticMeshScreenSize(uexpData);
@@ -343,7 +377,7 @@ public class ZenConverter
         BuildImportMap(asset, zenPackage);
 
         // Build export map with RECALCULATED SerialSize from actual data
-        BuildExportMapWithRecalculatedSizes(asset, zenPackage, uexpData, headerSize, totalPaddingToAdd);
+        BuildExportMapWithRecalculatedSizes(asset, zenPackage, uexpData, headerSize, totalPaddingToAdd, navCollisionSizeOverrides);
 
         // Build export bundles (required for UE5 to load assets)
         BuildExportBundles(asset, zenPackage);
@@ -373,7 +407,8 @@ public class ZenConverter
         FZenPackage zenPackage,
         byte[] uexpData,
         long headerSize,
-        int materialPaddingToAdd = 0)
+        int materialPaddingToAdd = 0,
+        Dictionary<int, long>? exportSizeOverrides = null)
     {
         // Calculate export sizes from the actual data
         // For non-last exports, use the gap between SerialOffsets (these are relative positions)
@@ -426,7 +461,14 @@ public class ZenConverter
             
             // Get pre-calculated size (padding already included for last export)
             long actualSize = exportSizes[export];
-            // Verbose logging disabled for parallel performance
+            
+            // Apply NavCollision CookedSerialSize overrides if present
+            int originalExportIndex = asset.Exports.IndexOf(export);
+            if (exportSizeOverrides != null && exportSizeOverrides.TryGetValue(originalExportIndex, out long overrideSize))
+            {
+                Console.Error.WriteLine($"[ZenConverter] Export {originalExportIndex} CookedSerialSize override: {actualSize} → {overrideSize}");
+                actualSize = overrideSize;
+            }
 
             // Remap indices from legacy FPackageIndex to Zen FPackageObjectIndex
             // Look up the import map which was already built with correct script import hashes
@@ -1766,6 +1808,119 @@ public class ZenConverter
         }
     }
     
+    /// <summary>
+    /// Re-serialize all exports in-place, preserving the asset's current name map.
+    /// This converts property format (e.g. versioned → unversioned) while keeping
+    /// binary Extras (FStaticMeshRenderData, etc.) unchanged.
+    /// </summary>
+    private static byte[]? ReserializeExportsInPlace(UAsset asset, long headerSize)
+    {
+        try
+        {
+            using var newStream = new MemoryStream();
+
+            for (int i = 0; i < asset.Exports.Count; i++)
+            {
+                var export = asset.Exports[i];
+                long exportStart = newStream.Position;
+
+                using var exportMs = new MemoryStream();
+                using var exportWriter = new AssetBinaryWriter(exportMs, asset);
+                export.Write(exportWriter);
+                exportWriter.Write(export.Extras);
+
+                byte[] newExportData = exportMs.ToArray();
+                newStream.Write(newExportData, 0, newExportData.Length);
+
+                export.SerialOffset = headerSize + exportStart;
+                export.SerialSize = newExportData.Length;
+            }
+
+            // Append trailing PACKAGE_FILE_TAG (0x9E2A83C1)
+            using var tagWriter = new BinaryWriter(newStream);
+            tagWriter.Write(0xC1832A9Eu);
+
+            byte[] result = newStream.ToArray();
+            Console.Error.WriteLine($"[ZenConverter] Re-serialized exports in-place: {result.Length} bytes (from offset {headerSize})");
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ZenConverter] ERROR: ReserializeExportsInPlace failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Calculate CookedSerialSize overrides for NavCollision exports.
+    /// Marvel Rivals' UNavCollision::Serialize reads only properties + 48 bytes of binary data,
+    /// but standard UE5 NavCollision writes additional collision geometry after that.
+    /// Instead of physically trimming the data (which corrupts the asset), we override
+    /// CookedSerialSize in the export map so the game reads only what it expects.
+    /// </summary>
+    private static Dictionary<int, long>? CalculateNavCollisionSizeOverrides(UAsset asset, byte[] uexpData, long headerSize)
+    {
+        Dictionary<int, long>? overrides = null;
+        byte[] navCollisionMarker = { 0x37, 0xF2, 0x37, 0xA2 };
+        const int NAV_COLLISION_BINARY_SIZE = 48;
+
+        for (int i = 0; i < asset.Exports.Count; i++)
+        {
+            string? className = null;
+            try { className = asset.Exports[i].GetExportClassType()?.Value?.Value; } catch { }
+            if (className != "NavCollision" && className != "NavCollisionBase")
+                continue;
+
+            var export = asset.Exports[i];
+            long exportDataStart = export.SerialOffset - headerSize;
+            long exportDataEnd = exportDataStart + export.SerialSize;
+            if (exportDataStart < 0 || exportDataEnd > uexpData.Length)
+                continue;
+
+            // Find properties end by searching for the NavCollision binary marker
+            int propertiesSize = 0;
+            for (int j = (int)exportDataStart; j < (int)exportDataEnd - 4; j++)
+            {
+                if (uexpData[j] == navCollisionMarker[0] &&
+                    uexpData[j + 1] == navCollisionMarker[1] &&
+                    uexpData[j + 2] == navCollisionMarker[2] &&
+                    uexpData[j + 3] == navCollisionMarker[3])
+                {
+                    propertiesSize = j - (int)exportDataStart;
+                    break;
+                }
+            }
+
+            if (propertiesSize == 0)
+            {
+                // Try None terminator for unversioned (just 2 bytes for empty FUnversionedHeader)
+                // For unversioned with no properties, propertiesSize may be very small
+                // Look for the marker more aggressively
+                for (int j = (int)exportDataStart; j < Math.Min((int)exportDataStart + 64, (int)exportDataEnd - 4); j++)
+                {
+                    if (uexpData[j] == navCollisionMarker[0] &&
+                        uexpData[j + 1] == navCollisionMarker[1] &&
+                        uexpData[j + 2] == navCollisionMarker[2] &&
+                        uexpData[j + 3] == navCollisionMarker[3])
+                    {
+                        propertiesSize = j - (int)exportDataStart;
+                        break;
+                    }
+                }
+            }
+
+            long correctSize = propertiesSize + NAV_COLLISION_BINARY_SIZE;
+            if (correctSize < export.SerialSize)
+            {
+                overrides ??= new Dictionary<int, long>();
+                overrides[i] = correctSize;
+                Console.Error.WriteLine($"[ZenConverter] SM: NavCollision export {i}: CookedSerialSize override {export.SerialSize} → {correctSize} (props={propertiesSize}, binary={NAV_COLLISION_BINARY_SIZE})");
+            }
+        }
+
+        return overrides;
+    }
+
     /// <summary>
     /// Patch StaticMesh ScreenSize entries from standard UE5 format (8 bytes each, 64 total)
     /// to Marvel Rivals format (16 bytes each, 128 total).

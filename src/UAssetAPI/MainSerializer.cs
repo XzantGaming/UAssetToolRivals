@@ -119,18 +119,6 @@ namespace UAssetAPI
                 }
             }
 
-            // Fetch the current git commit while we're here
-            UAPUtils.CurrentCommit = string.Empty;
-            using (Stream stream = registryParentDataType.Assembly.GetManifestResourceStream("UAssetAPI.git_commit.txt"))
-            {
-                if (stream != null)
-                {
-                    using (StreamReader reader = new StreamReader(stream))
-                    {
-                        if (reader != null) UAPUtils.CurrentCommit = reader.ReadToEnd().Trim();
-                    }
-                }
-            }
         }
 
         /// <summary>
