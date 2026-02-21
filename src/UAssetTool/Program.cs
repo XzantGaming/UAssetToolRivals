@@ -60,6 +60,7 @@ public partial class Program
                 "extract_iostore" => CliExtractIoStore(args),
                 "extract_iostore_legacy" => CliExtractIoStoreLegacy(args),
                 "is_iostore_compressed" => CliIsIoStoreCompressed(args),
+                "is_iostore_encrypted" => CliIsIoStoreEncrypted(args),
                 "extract_script_objects" => CliExtractScriptObjects(args),
                 "recompress_iostore" => CliRecompressIoStore(args),
                 "cityhash" => CliCityHash(args),
@@ -927,6 +928,32 @@ public partial class Program
         {
             bool isCompressed = IoStore.IoStoreReader.IsCompressed(utocPath);
             Console.WriteLine(isCompressed ? "true" : "false");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return 1;
+        }
+    }
+
+    /// <summary>
+    /// Check if an IoStore container is encrypted (obfuscated).
+    /// </summary>
+    private static int CliIsIoStoreEncrypted(string[] args)
+    {
+        if (args.Length < 2)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool is_iostore_encrypted <utoc_path>");
+            return 1;
+        }
+
+        string utocPath = args[1];
+        
+        try
+        {
+            bool isEncrypted = IoStore.IoStoreReader.IsEncrypted(utocPath);
+            Console.WriteLine(isEncrypted ? "true" : "false");
             return 0;
         }
         catch (Exception ex)
@@ -2226,6 +2253,7 @@ public partial class Program
                 "list_iostore_files" => ListIoStoreFiles(request.FilePath, request.AesKey),
                 "create_iostore" => CreateIoStoreJson(request.OutputPath, request.InputDir, request.UsmapPath, request.Compress, request.AesKey),
                 "is_iostore_compressed" => IsIoStoreCompressed(request.FilePath),
+                "is_iostore_encrypted" => IsIoStoreEncrypted(request.FilePath),
                 "recompress_iostore" => RecompressIoStore(request.FilePath),
                 "extract_iostore" => ExtractIoStoreJson(request.FilePath, request.OutputPath, request.AesKey),
                 "extract_script_objects" => ExtractScriptObjectsJson(request.FilePath, request.OutputPath),
@@ -4868,6 +4896,33 @@ public partial class Program
         }
     }
     
+    /// <summary>
+    /// Check if an IoStore container is encrypted (obfuscated)
+    /// </summary>
+    private static UAssetResponse IsIoStoreEncrypted(string? utocPath)
+    {
+        if (string.IsNullOrEmpty(utocPath))
+            return new UAssetResponse { Success = false, Message = "UTOC path is required" };
+        
+        if (!File.Exists(utocPath))
+            return new UAssetResponse { Success = false, Message = $"UTOC file not found: {utocPath}" };
+        
+        try
+        {
+            bool isEncrypted = IoStore.IoStoreReader.IsEncrypted(utocPath);
+            return new UAssetResponse
+            {
+                Success = true,
+                Message = isEncrypted ? "IoStore is encrypted" : "IoStore is not encrypted",
+                Data = new Dictionary<string, object?> { ["encrypted"] = isEncrypted }
+            };
+        }
+        catch (Exception ex)
+        {
+            return new UAssetResponse { Success = false, Message = $"Failed to check encryption: {ex.Message}" };
+        }
+    }
+
     /// <summary>
     /// Recompress an IoStore container with Oodle
     /// </summary>
