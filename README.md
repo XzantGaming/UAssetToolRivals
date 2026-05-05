@@ -637,7 +637,7 @@ UassetToolRivals/
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+GPL-3.0 License - See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
