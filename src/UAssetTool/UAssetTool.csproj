@@ -12,7 +12,7 @@
     <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
     <AssemblyName>UAssetTool</AssemblyName>
     <RootNamespace>UAssetTool</RootNamespace>
-    <Authors>XzantGaming</Authors>
+    <Authors>Xzant</Authors>
     <RepositoryUrl>https://github.com/XzantGaming/UassetToolRivals</RepositoryUrl>
     <Version>1.0.0</Version>
   </PropertyGroup>
