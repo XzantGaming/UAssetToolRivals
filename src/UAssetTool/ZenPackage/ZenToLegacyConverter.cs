@@ -151,14 +151,51 @@ public class ZenToLegacyConverter
         }
     }
 
+    /// <summary>
+    /// Heuristic: a "bare leaf name" is a package name that lacks a directory path
+    /// (no slashes, or doesn't start with a UE root prefix like /Game/, /Engine/,
+    /// /Script/, /Plugins/). Such names are anomalous for a Summary.Name and indicate
+    /// the package was authored with only the leaf object name stored.
+    /// </summary>
+    private static bool LooksLikeBareLeafName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return true;
+        if (!name.Contains('/')) return true; // no slashes => bare leaf
+        if (name.StartsWith("/Game/", StringComparison.OrdinalIgnoreCase)) return false;
+        if (name.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return false;
+        if (name.StartsWith("/Script/", StringComparison.OrdinalIgnoreCase)) return false;
+        if (name.StartsWith("/Plugins/", StringComparison.OrdinalIgnoreCase)) return false;
+        // Any other absolute UE-style root (starts with '/') is acceptable
+        if (name.StartsWith("/")) return false;
+        // Has slashes but no leading slash - probably still a path, accept it
+        return false;
+    }
+
     private void BeginBuildSummary()
     {
         // Use the zen package's own SourcePackageName for the FolderName.
-        // Do NOT use _context.GetPackagePath() here because the UTOC directory index
-        // may have different casing than the zen name map (e.g., "Mvp" vs "MVP").
-        // Retoc also uses the zen package name, not the UTOC directory path.
+        // Normally we prefer this over _context.GetPackagePath() because the UTOC
+        // directory index may have different casing than the zen name map
+        // (e.g., "Mvp" vs "MVP"). Retoc also uses the zen package name.
+        //
+        // HOWEVER: some assets (especially mods) ship with a Summary.Name that only
+        // contains the leaf object name (e.g. "SK_1033_1033502") instead of the full
+        // package path. In that case we must fall back to the UTOC directory index,
+        // otherwise the written .uasset's FolderName loses the full /Game/.../ path
+        // and tools (FModel, the game itself when re-imported) lose track of where
+        // the asset belongs.
         string packageName = _zenPackage.SourcePackageName();
-        
+        if (LooksLikeBareLeafName(packageName) && _context != null && _packageId != 0)
+        {
+            string? fullPath = _context.GetPackagePath(_packageId);
+            if (!string.IsNullOrEmpty(fullPath) && !LooksLikeBareLeafName(fullPath))
+            {
+                if (_debugMode)
+                    Console.Error.WriteLine($"[BeginBuildSummary] Summary.Name='{packageName}' is bare leaf; using UTOC path '{fullPath}'");
+                packageName = fullPath;
+            }
+        }
+
         // Normalize package name - resolve /../ patterns
         // e.g., /Game/Marvel/../../../Marvel/Content/Marvel/Characters/... -> /Game/Marvel/Characters/...
         if (packageName.Contains("/../"))
