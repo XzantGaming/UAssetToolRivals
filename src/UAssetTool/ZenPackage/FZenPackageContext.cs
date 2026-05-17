@@ -371,51 +371,36 @@ public class FZenPackageContext : IDisposable
     }
 
     /// <summary>
-    /// Get a package by its ID (lazy loading with caching)
+    /// Get a package by its ID (lazy loading with caching).
+    /// Thread-safe: IoStoreReader.ReadChunk uses RandomAccess (no seek races).
+    /// ConcurrentDictionary.GetOrAdd serializes duplicate loads for the same key.
     /// </summary>
     public FZenPackageHeader? GetPackage(ulong packageId)
     {
-        // Check cache first (lock-free fast path)
+        // Fast path: already cached
         if (_packageCache.TryGetValue(packageId, out var cached))
-        {
             return cached.Header;
-        }
         
-        // Slow path: load from disk under lock (IoStoreReader isn't thread-safe)
-        lock (_loadLock)
+        if (!_packageIdToChunk.TryGetValue(packageId, out var location))
+            return null;
+
+        try
         {
-            // Double-check after acquiring lock
-            if (_packageCache.TryGetValue(packageId, out cached))
-                return cached.Header;
-            
-            if (!_packageIdToChunk.TryGetValue(packageId, out var location))
-                return null;
-            
-            try
+            var result = _packageCache.GetOrAdd(packageId, _ =>
             {
                 var reader = _containers[location.ContainerIndex];
                 byte[] rawData = reader.ReadChunk(location.ChunkId);
-                
-                
                 var header = FZenPackageHeader.Deserialize(rawData, ContainerHeaderVersion);
-                
-                var cachedPackage = new CachedPackage
-                {
-                    Header = header,
-                    RawData = rawData,
-                    PackageId = packageId
-                };
-                _packageCache[packageId] = cachedPackage;
-                
-                IndexPackageExports(packageId, header);
-                
-                return header;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[Context] Failed to load package {packageId:X16}: {ex.Message}");
-                return null;
-            }
+                var pkg = new CachedPackage { Header = header, RawData = rawData, PackageId = packageId };
+                lock (_loadLock) { IndexPackageExports(packageId, header); }
+                return pkg;
+            });
+            return result.Header;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Context] Failed to load package {packageId:X16}: {ex.Message}");
+            return null;
         }
     }
 

@@ -59,7 +59,12 @@ namespace UAssetAPI
         /// <summary>
         /// Skip parsing exports at read time. Entries in the export map will be read as raw exports. You can manually parse exports with the <see cref="UAsset.ParseExport(AssetBinaryReader, int, bool)"/> method.
         /// </summary>
-        SkipParsingExports = 8
+        SkipParsingExports = 8,
+
+        /// <summary>
+        /// Skip loading exports at read time altogether. Entries in the export map will be read as raw exports of zero length, so they cannot be manually parsed later. If this flag is set, SkipParsingExports will also effectively be automatically set regardless of whether or not it was already set manually.
+        /// </summary>
+        SkipLoadingExports = 16,
     }
 
 
@@ -1271,7 +1276,7 @@ namespace UAssetAPI
                 // initial read to just fetch the FolderName
                 UAsset otherAsset = new UAsset(this.ObjectVersion, this.ObjectVersionUE5, this.CustomVersionContainer.Select(item => (CustomVersion)item.Clone()).ToList(), this.Mappings);
                 AssetBinaryReader otherReader = otherAsset.PathToReader(pathOnDisk);
-                otherAsset.CustomSerializationFlags = CustomSerializationFlags.SkipParsingExports | CustomSerializationFlags.SkipPreloadDependencyLoading;
+                otherAsset.CustomSerializationFlags = CustomSerializationFlags.SkipLoadingExports | CustomSerializationFlags.SkipPreloadDependencyLoading;
                 otherAsset.FilePath = pathOnDisk;
                 otherAsset.Read(otherReader);
 
@@ -1556,6 +1561,14 @@ namespace UAssetAPI
 
         /// <summary>Location into the file on disk for the asset registry tag data</summary>
         internal int AssetRegistryDataOffset;
+
+        /// <summary>
+        /// Difference between AssetRegistryDataOffset and AssetRegistryDependencyDataOffset.
+        /// Captured at read time so it can be used to recompute the AssetRegistryDependencyDataOffset stored
+        /// inside AssetRegistryData when the asset is rewritten and tables before the dependency data shift.
+        /// Ported from atenfyr/UAssetAPI@6ed0cb26 (drcxd, PR #121).
+        /// </summary>
+        internal int DiffBetweenArdoAndArddo;
 
         /// <summary>Offset to the location in the file where the bulkdata starts</summary>
         internal long BulkDataStartOffset;
@@ -1998,6 +2011,12 @@ namespace UAssetAPI
             AssetRegistryData = [];
             if (AssetRegistryDataOffset > 0)
             {
+                // Capture the AssetRegistryDependencyDataOffset stored at the start of AssetRegistryData
+                // (first int64). We need this so we can rewrite it correctly when tables before it shift.
+                reader.BaseStream.Seek(AssetRegistryDataOffset, SeekOrigin.Begin);
+                long AssetRegistryDependencyDataOffset = reader.ReadInt64();
+                DiffBetweenArdoAndArddo = (int)(AssetRegistryDataOffset - AssetRegistryDependencyDataOffset);
+
                 reader.BaseStream.Seek(AssetRegistryDataOffset, SeekOrigin.Begin);
                 /*
                 int numAssets = reader.ReadInt32();
@@ -2128,7 +2147,8 @@ namespace UAssetAPI
 
             if (reader.LoadUexp)
             {
-                bool skipParsingExports = CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipParsingExports);
+                bool skipLoadingExports = CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipLoadingExports);
+                bool skipParsingExports = skipLoadingExports || CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipParsingExports);
 
                 // SCHEMA REFERENCES FIX
                 // Aggressively pull schemas for all dependencies (Packages starting with /Game/)
@@ -2183,11 +2203,11 @@ namespace UAssetAPI
                     {
                         int i = exportIdx - 1;
 
-                        reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
-                        if (skipParsingExports || (manualSkips != null && manualSkips.Contains(i) && (forceReads == null || !forceReads.Contains(i))))
+                        if (!skipLoadingExports) reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
+                        if (skipParsingExports || skipLoadingExports || (manualSkips != null && manualSkips.Contains(i) && (forceReads == null || !forceReads.Contains(i))))
                         {
                             Exports[i] = Exports[i].ConvertToChildExport<RawExport>();
-                            ((RawExport)Exports[i]).Data = reader.ReadBytes((int)Exports[i].SerialSize);
+                            ((RawExport)Exports[i]).Data = skipLoadingExports ? Array.Empty<byte>() : reader.ReadBytes((int)Exports[i].SerialSize);
                             continue;
                         }
 
@@ -2199,11 +2219,11 @@ namespace UAssetAPI
                     {
                         if (Exports[i].alreadySerialized) continue;
 
-                        reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
-                        if (skipParsingExports || (manualSkips != null && manualSkips.Contains(i) && (forceReads == null || !forceReads.Contains(i))))
+                        if (!skipLoadingExports) reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
+                        if (skipParsingExports || skipLoadingExports || (manualSkips != null && manualSkips.Contains(i) && (forceReads == null || !forceReads.Contains(i))))
                         {
                             Exports[i] = Exports[i].ConvertToChildExport<RawExport>();
-                            ((RawExport)Exports[i]).Data = reader.ReadBytes((int)Exports[i].SerialSize);
+                            ((RawExport)Exports[i]).Data = skipLoadingExports ? Array.Empty<byte>() : reader.ReadBytes((int)Exports[i].SerialSize);
                             continue;
                         }
 
@@ -2735,6 +2755,20 @@ namespace UAssetAPI
                     {
                         throw new NotImplementedException("Asset registry data is not yet supported. Please let me know if you see this error message");
                     }*/
+
+                    // Patch the AssetRegistryDependencyDataOffset (first 8 bytes of AssetRegistryData)
+                    // so it stays consistent when tables before it have shifted.
+                    // Heuristic: assume the diff between AssetRegistryDataOffset and AssetRegistryDependencyDataOffset
+                    // is unchanged across the rewrite. Ported from atenfyr/UAssetAPI@6ed0cb26 (drcxd).
+                    if (AssetRegistryData != null && AssetRegistryData.Length >= sizeof(long))
+                    {
+                        long NewAssetRegistryDependencyDataOffset = AssetRegistryDataOffset - DiffBetweenArdoAndArddo;
+                        byte[] Bytes = BitConverter.GetBytes(NewAssetRegistryDependencyDataOffset);
+                        for (int i = 0; i < Bytes.Length; ++i)
+                        {
+                            AssetRegistryData[i] = Bytes[i];
+                        }
+                    }
 
                     writer.Write(AssetRegistryData);
                 }

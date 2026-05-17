@@ -1374,8 +1374,8 @@ public partial class Program
             int failed = 0;
             int skipped = 0;
             
-            // Track extracted packages to avoid duplicates
-            HashSet<ulong> extractedPackages = new();
+            // Track extracted packages to avoid duplicates (ConcurrentDictionary used as concurrent set)
+            var extractedPackages = new System.Collections.Concurrent.ConcurrentDictionary<ulong, bool>();
             HashSet<ulong> pendingDependencies = new();
             
             // Get package IDs to extract
@@ -1461,176 +1461,142 @@ public partial class Program
                 return 1;
             }
 
-            // Helper function to extract a single package
+            bool debugMode = Environment.GetEnvironmentVariable("DEBUG") == "1";
+
+            // Helper: resolve output path from package name
+            static string ResolveOutputPath(string packageName)
+            {
+                string relPath = packageName;
+                if (relPath.Contains("/../"))
+                {
+                    string tempRoot = Path.GetTempPath();
+                    string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                    string resolved = Path.GetFullPath(tempPath);
+                    relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
+                    if (!relPath.StartsWith("/")) relPath = "/" + relPath;
+                    int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+                    if (contentIdx >= 0)
+                        relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
+                }
+                if (relPath.StartsWith("/Game/"))
+                    relPath = "Marvel/Content/" + relPath.Substring(6);
+                else if (relPath.StartsWith("/"))
+                    relPath = relPath.Substring(1);
+                relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
+                if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
+                    relPath += ".uasset";
+                return relPath;
+            }
+
+            // Helper function to extract a single package (thread-safe)
             List<ulong> ExtractPackage(ulong packageId, bool isDependency)
             {
                 List<ulong> imports = new();
-                
-                if (extractedPackages.Contains(packageId))
+
+                if (extractedPackages.ContainsKey(packageId))
                     return imports;
-                
-                // Get full package path from TOC directory index if available
+
                 string? fullPath = context.GetPackagePath(packageId);
-                
-                // Apply filter only for primary packages (not dependencies) and only if not already filtered
+
                 if (!isDependency && !skipFilterCheck && filterPatterns.Count > 0)
                 {
-                    bool matchesAnyFilter = filterPatterns.Any(filter => 
+                    bool matchesAnyFilter = filterPatterns.Any(filter =>
                         !string.IsNullOrEmpty(fullPath) && fullPath.Contains(filter, StringComparison.OrdinalIgnoreCase));
                     if (!matchesAnyFilter)
-                    {
-                        return imports; // Don't count as skipped, just not matching filter
-                    }
+                        return imports;
                 }
-                
+
                 var cached = context.GetCachedPackage(packageId);
                 if (cached == null)
                 {
                     string skipMsg = !string.IsNullOrEmpty(fullPath) ? fullPath : $"package ID {packageId:X16}";
-                    if (isDependency || Environment.GetEnvironmentVariable("DEBUG") == "1")
+                    if (isDependency || debugMode)
                         Console.WriteLine($"  Skipped (not found): {skipMsg}");
-                    skipped++;
+                    Interlocked.Increment(ref skipped);
                     return imports;
                 }
-                
+
                 string packageName = !string.IsNullOrEmpty(fullPath) ? fullPath : cached.Header.PackageName();
 
                 try
                 {
                     string prefix = isDependency ? "[DEP] " : "";
-                    if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                    if (debugMode)
                         Console.WriteLine($"  {prefix}Converting: {packageName} ({cached.RawData.Length} bytes)");
 
-                    // Convert to legacy format using proper Rust-ported converter
                     var converter = new ZenPackage.ZenToLegacyConverter(context, packageId);
-                    if (Environment.GetEnvironmentVariable("DEBUG") == "1")
-                        converter.SetDebugMode(true);
+                    if (debugMode) converter.SetDebugMode(true);
                     var legacyBundle = converter.Convert();
 
-                    // Collect import package IDs for dependency extraction
                     if (extractDependencies)
                     {
-                        // Show what imports we found for debugging
-                        if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                        if (debugMode)
                         {
                             Console.WriteLine($"    Imports for {packageName}:");
                             foreach (var (id, name) in converter.GetImportedPackageInfo())
-                            {
                                 Console.WriteLine($"      {id:X16} = {name}");
-                            }
                         }
                         imports.AddRange(converter.GetImportedPackageIds());
                     }
 
-                    // Write output files - use the package name (from TOC or fallback)
-                    // Normalize path (handle /../ patterns like /Game/Marvel/../../../Marvel/Content/...)
-                    string relPath = packageName;
-                    
-                    // First resolve any /../ patterns by using Path.GetFullPath with a fake root
-                    if (relPath.Contains("/../"))
-                    {
-                        // Use a temp root to resolve relative segments, then extract the result
-                        string tempRoot = Path.GetTempPath();
-                        string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
-                        string resolved = Path.GetFullPath(tempPath);
-                        relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
-                        if (!relPath.StartsWith("/"))
-                            relPath = "/" + relPath;
-                        // The resolved path is like /Marvel/Content/Marvel/Characters/...
-                        // /Marvel/Content is the game root (= /Game), so extract everything after it
-                        // Result should be /Game/Marvel/Characters/...
-                        int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-                        if (contentIdx >= 0)
-                            relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
-                    }
-                    
-                    // Map /Game/ back to Marvel/Content/ to match the on-disk path structure
-                    // /Game/Marvel/VFX/... -> Marvel/Content/Marvel/VFX/...
-                    if (relPath.StartsWith("/Game/"))
-                        relPath = "Marvel/Content/" + relPath.Substring(6);
-                    else if (relPath.StartsWith("/"))
-                        relPath = relPath.Substring(1); // Remove leading slash
-                    
-                    relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
-                    if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
-                        relPath += ".uasset";
-
+                    string relPath = ResolveOutputPath(packageName);
                     string outputAssetPath = Path.Combine(outputDir, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
                         Directory.CreateDirectory(outputAssetDir);
 
-                    // Write .uasset
                     File.WriteAllBytes(outputAssetPath, legacyBundle.AssetData);
+                    File.WriteAllBytes(Path.ChangeExtension(outputAssetPath, ".uexp"), legacyBundle.ExportsData);
 
-                    // Write .uexp
-                    string outputUexpPath = Path.ChangeExtension(outputAssetPath, ".uexp");
-                    File.WriteAllBytes(outputUexpPath, legacyBundle.ExportsData);
-
-                    // Write bulk data files if present
                     if (legacyBundle.BulkData != null && legacyBundle.BulkData.Length > 0)
-                    {
-                        string outputBulkPath = Path.ChangeExtension(outputAssetPath, ".ubulk");
-                        File.WriteAllBytes(outputBulkPath, legacyBundle.BulkData);
-                    }
-                    
+                        File.WriteAllBytes(Path.ChangeExtension(outputAssetPath, ".ubulk"), legacyBundle.BulkData);
                     if (legacyBundle.OptionalBulkData != null && legacyBundle.OptionalBulkData.Length > 0)
-                    {
-                        string outputUptnlPath = Path.ChangeExtension(outputAssetPath, ".uptnl");
-                        File.WriteAllBytes(outputUptnlPath, legacyBundle.OptionalBulkData);
-                    }
-                    
+                        File.WriteAllBytes(Path.ChangeExtension(outputAssetPath, ".uptnl"), legacyBundle.OptionalBulkData);
                     if (legacyBundle.MemoryMappedBulkData != null && legacyBundle.MemoryMappedBulkData.Length > 0)
-                    {
-                        string outputMBulkPath = Path.ChangeExtension(outputAssetPath, ".m.ubulk");
-                        File.WriteAllBytes(outputMBulkPath, legacyBundle.MemoryMappedBulkData);
-                    }
+                        File.WriteAllBytes(Path.ChangeExtension(outputAssetPath, ".m.ubulk"), legacyBundle.MemoryMappedBulkData);
 
-                    extractedPackages.Add(packageId);
-                    converted++;
+                    extractedPackages.TryAdd(packageId, true);
+                    Interlocked.Increment(ref converted);
                     Console.WriteLine($"{prefix}Converted: {packageName}");
                 }
                 catch (Exception ex)
                 {
-                    failed++;
+                    Interlocked.Increment(ref failed);
                     Console.Error.WriteLine($"Failed to convert {packageName}: {ex.Message}");
-                    if (Environment.GetEnvironmentVariable("DEBUG") == "1")
-                        Console.Error.WriteLine(ex.StackTrace);
+                    if (debugMode) Console.Error.WriteLine(ex.StackTrace);
                 }
-                
+
                 return imports;
             }
 
-            // Process primary packages
-            foreach (var packageId in packageIds)
+            // Process primary packages in parallel (each ZenToLegacyConverter is independent)
+            var allImports = new System.Collections.Concurrent.ConcurrentBag<ulong>();
+            Parallel.ForEach(packageIds, packageId =>
             {
                 var imports = ExtractPackage(packageId, isDependency: false);
-                foreach (var importId in imports)
-                {
-                    if (!extractedPackages.Contains(importId))
-                        pendingDependencies.Add(importId);
-                }
+                foreach (var id in imports) allImports.Add(id);
+            });
+
+            if (extractDependencies)
+            {
+                foreach (var id in allImports)
+                    if (!extractedPackages.ContainsKey(id)) pendingDependencies.Add(id);
             }
 
-            // Process dependencies if enabled
+            // Process dependencies sequentially (order matters for dep graph traversal)
             if (extractDependencies && pendingDependencies.Count > 0)
             {
                 Console.WriteLine($"\nExtracting {pendingDependencies.Count} dependencies...");
-                
-                // Process dependencies iteratively (could go multiple levels deep)
                 while (pendingDependencies.Count > 0)
                 {
                     var currentBatch = pendingDependencies.ToList();
                     pendingDependencies.Clear();
-                    
                     foreach (var depId in currentBatch)
                     {
                         var newImports = ExtractPackage(depId, isDependency: true);
                         foreach (var importId in newImports)
-                        {
-                            if (!extractedPackages.Contains(importId))
+                            if (!extractedPackages.ContainsKey(importId))
                                 pendingDependencies.Add(importId);
-                        }
                     }
                 }
             }
@@ -5183,7 +5149,7 @@ public partial class Program
             int extracted = 0;
             int failed = 0;
             
-            foreach (var file in filesToExtract)
+            Parallel.ForEach(filesToExtract, file =>
             {
                 try
                 {
@@ -5193,11 +5159,9 @@ public partial class Program
                     string relativePath = file;
                     if (relativePath.StartsWith("../"))
                     {
-                        // Remove leading ../../../ etc
                         while (relativePath.StartsWith("../"))
                             relativePath = relativePath.Substring(3);
                     }
-                    // Remove leading / or \
                     relativePath = relativePath.TrimStart('/', '\\');
                     
                     string outputPath = Path.Combine(outputDir, relativePath);
@@ -5206,19 +5170,18 @@ public partial class Program
                         Directory.CreateDirectory(outputDirPath);
                     
                     File.WriteAllBytes(outputPath, data);
-                    extracted++;
-                    
-                    if (extracted % 10 == 0 || extracted == filesToExtract.Count)
+                    int cur = Interlocked.Increment(ref extracted);
+                    if (cur % 50 == 0 || cur == filesToExtract.Count)
                     {
-                        Console.Error.WriteLine($"[ExtractPak] Extracted {extracted}/{filesToExtract.Count} files...");
+                        Console.Error.WriteLine($"[ExtractPak] Extracted {cur}/{filesToExtract.Count} files...");
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine($"[ExtractPak] Failed to extract '{file}': {ex.Message}");
-                    failed++;
+                    Interlocked.Increment(ref failed);
                 }
-            }
+            });
             
             Console.WriteLine($"Extraction complete: {extracted} extracted, {failed} failed");
             Console.WriteLine($"Output directory: {outputDir}");

@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace UAssetTool.IoStore;
 
@@ -20,6 +22,7 @@ public class PakReader : IDisposable
     private const string DEFAULT_AES_KEY_HEX = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
 
     private readonly Stream _stream;
+    private readonly SafeFileHandle? _fileHandle; // Non-null when backed by a real file; enables thread-safe RandomAccess reads
     private readonly byte[] _aesKey;
     private readonly byte[] _standardAesKey; // Key without byte-swap for standard UE4 PAKs
     private readonly bool _ownsStream;
@@ -35,17 +38,30 @@ public class PakReader : IDisposable
     // Index data
     private readonly Dictionary<string, PakEntry> _entries = new();
     
+    // Cache for encryption limits (path -> limit) to avoid re-hashing on repeat access
+    // ConcurrentDictionary so Get() is safe to call from Parallel.ForEach
+    private readonly ConcurrentDictionary<string, int> _encryptionLimitCache = new();
+    
     // Compression methods from footer
     private readonly string[] _compressionMethods = new string[5];
 
     public PakReader(string pakPath, string? aesKeyHex = null, bool useStandardAes = false)
-        : this(File.OpenRead(pakPath), aesKeyHex, ownsStream: true, useStandardAes: useStandardAes)
     {
+        var fs = new FileStream(pakPath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 1, useAsync: false);
+        _stream = fs;
+        _fileHandle = fs.SafeFileHandle;
+        _ownsStream = true;
+        _useStandardAes = useStandardAes;
+        string keyHex = aesKeyHex ?? DEFAULT_AES_KEY_HEX;
+        _aesKey = ParseAesKey(keyHex);
+        _standardAesKey = ParseAesKeyStandard(keyHex);
+        ReadPak();
     }
 
     public PakReader(Stream stream, string? aesKeyHex = null, bool ownsStream = false, bool useStandardAes = false)
     {
         _stream = stream;
+        _fileHandle = (stream is FileStream fs) ? fs.SafeFileHandle : null;
         _ownsStream = ownsStream;
         _useStandardAes = useStandardAes;
         string keyHex = aesKeyHex ?? DEFAULT_AES_KEY_HEX;
@@ -93,7 +109,7 @@ public class PakReader : IDisposable
     /// <summary>
     /// Get list of all file paths in the PAK
     /// </summary>
-    public IReadOnlyList<string> Files => _entries.Keys.ToList();
+    public IReadOnlyCollection<string> Files => _entries.Keys;
 
     /// <summary>
     /// Get entry info for a specific file
@@ -445,6 +461,7 @@ public class PakReader : IDisposable
     /// 4. Decrypt entire blob with plain AES-256-ECB
     /// 5. Truncate to actual compressed size
     /// 6. Slice by block ranges for decompression
+    /// Uses RandomAccess.Read when backed by a file (thread-safe, no seek contention).
     /// </summary>
     private byte[] ReadEntryData(PakEntry entry, string path)
     {
@@ -457,29 +474,37 @@ public class PakReader : IDisposable
         if (uncompressedSize == 0)
             return Array.Empty<byte>();
 
-        // Step 1: Seek to entry offset
-        _stream.Seek((long)entry.Offset, SeekOrigin.Begin);
-
-        // Step 2: Read the inline FPakEntry header to advance past it (matching repak Entry::read)
-        // This reads: offset(8) + compressed(8) + uncompressed(8) + compression(4) + hash(20)
-        // + blocks(if compressed: 4 + 16*N) + flags(1) + compression_block_size(4)
-        ReadInlineEntryHeader(entry);
-        long dataOffset = _stream.Position;
+        // Compute inline header size from known entry metadata (no seek needed)
+        long structSize = (long)GetSerializedEntrySize(entry.CompressionSlot.HasValue ? entry.CompressionSlot : null, entry.CompressionBlocksCount);
+        long dataOffset = (long)entry.Offset + structSize;
 
         if (Environment.GetEnvironmentVariable("DEBUG") == "1")
         {
-            Console.Error.WriteLine($"[PakReader] ReadEntryData '{path}': entryOffset={entry.Offset}, dataOffset={dataOffset}, structSize={dataOffset - (long)entry.Offset}, compressed={entry.CompressedSize}, uncompressed={uncompressedSize}, encrypted={isEncrypted}");
+            Console.Error.WriteLine($"[PakReader] ReadEntryData '{path}': entryOffset={entry.Offset}, dataOffset={dataOffset}, structSize={structSize}, compressed={entry.CompressedSize}, uncompressed={uncompressedSize}, encrypted={isEncrypted}");
         }
 
-        // Step 3: Read ALL compressed data at once
+        // Step 3: Read ALL compressed data at once (thread-safe positional read when file-backed)
         long readSize = isEncrypted 
             ? ((long)entry.CompressedSize + 15) & ~15L  // align to AES block size
             : (long)entry.CompressedSize;
         
         byte[] data = new byte[readSize];
-        int bytesRead = _stream.Read(data, 0, (int)readSize);
-        if (bytesRead != (int)readSize)
-            throw new InvalidDataException($"Failed to read entry data: expected {readSize} bytes, got {bytesRead}");
+        if (_fileHandle != null)
+        {
+            int bytesRead = RandomAccess.Read(_fileHandle, data.AsSpan(), dataOffset);
+            if (bytesRead != (int)readSize)
+                throw new InvalidDataException($"Failed to read entry data: expected {readSize} bytes, got {bytesRead}");
+        }
+        else
+        {
+            lock (_stream)
+            {
+                _stream.Seek(dataOffset, SeekOrigin.Begin);
+                int bytesRead = _stream.Read(data, 0, (int)readSize);
+                if (bytesRead != (int)readSize)
+                    throw new InvalidDataException($"Failed to read entry data: expected {readSize} bytes, got {bytesRead}");
+            }
+        }
 
         // Step 4: Partial decryption (Marvel Rivals uses partial encryption via blake3 path hash)
         // Only the first get_limit(path) bytes are encrypted, matching repak-rivals data.rs
@@ -487,7 +512,7 @@ public class PakReader : IDisposable
         if (isEncrypted)
         {
             string rootPath = ComputeRootPath(MountPoint, path);
-            int limit = GetEncryptionLimit(rootPath);
+            int limit = _encryptionLimitCache.GetOrAdd(rootPath, GetEncryptionLimit);
             if (limit > data.Length)
                 limit = data.Length;
             // Align limit to AES block size (16 bytes)
@@ -527,7 +552,6 @@ public class PakReader : IDisposable
         if (entry.Blocks == null || entry.Blocks.Count == 0)
             throw new InvalidDataException($"Compressed entry has no block info");
 
-        long structSize = dataOffset - (long)entry.Offset;
         uint blockSize = entry.CompressionBlockSize > 0 ? entry.CompressionBlockSize : 65536;
 
         using var outputStream = new MemoryStream((int)uncompressedSize);
@@ -737,18 +761,20 @@ public class PakReader : IDisposable
         aes.Padding = PaddingMode.None;
 
         byte[] result = new byte[paddedData.Length];
+        // Create decryptor once outside the loop
+        using var decryptor = aes.CreateDecryptor();
+        byte[] block = new byte[16];
+        byte[] decrypted = new byte[16];
 
         for (int i = 0; i < paddedData.Length; i += 16)
         {
-            byte[] block = new byte[16];
             Array.Copy(paddedData, i, block, 0, 16);
 
             // Reverse each 4-byte chunk BEFORE decryption
             ReverseChunks(block);
 
-            // Decrypt the block
-            using var decryptor = aes.CreateDecryptor();
-            byte[] decrypted = decryptor.TransformFinalBlock(block, 0, 16);
+            // Decrypt the block (reuse decryptor, reset via TransformBlock)
+            decryptor.TransformBlock(block, 0, 16, decrypted, 0);
 
             // Reverse each 4-byte chunk AFTER decryption
             ReverseChunks(decrypted);

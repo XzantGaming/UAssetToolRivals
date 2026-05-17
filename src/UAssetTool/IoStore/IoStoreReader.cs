@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace UAssetTool.IoStore;
 
@@ -18,6 +19,8 @@ public class IoStoreReader : IDisposable
     private readonly string _ucasPath;
     private readonly IoStoreToc _toc;
     private FileStream? _casStream;
+    private SafeFileHandle? _casHandle; // set once CAS is opened; enables thread-safe RandomAccess reads
+    private readonly object _casOpenLock = new();
     private readonly byte[]? _aesKey;
 
     public string ContainerName => _containerName;
@@ -227,12 +230,19 @@ public class IoStoreReader : IDisposable
         ulong offset = offsetAndLength.Offset;
         ulong size = offsetAndLength.Length;
 
+        // Helper: thread-safe positional read via RandomAccess
+        void ReadAt(long pos, byte[] buf, int bufOffset, int count)
+        {
+            int got = RandomAccess.Read(_casHandle!, buf.AsSpan(bufOffset, count), pos);
+            if (got != count)
+                throw new IOException($"CAS short read at {pos}: expected {count}, got {got}");
+        }
+
         // If no compression blocks, read directly from CAS
         if (_toc.CompressionBlocks.Count == 0)
         {
             byte[] data = new byte[size];
-            _casStream!.Seek((long)offset, SeekOrigin.Begin);
-            _casStream.ReadExactly(data, 0, (int)size);
+            ReadAt((long)offset, data, 0, (int)size);
             return data;
         }
 
@@ -243,10 +253,8 @@ public class IoStoreReader : IDisposable
         // Bounds check
         if (firstBlockIndex >= _toc.CompressionBlocks.Count || lastBlockIndex >= _toc.CompressionBlocks.Count)
         {
-            // Fall back to direct read
             byte[] directData = new byte[size];
-            _casStream!.Seek((long)offset, SeekOrigin.Begin);
-            _casStream.ReadExactly(directData, 0, (int)size);
+            ReadAt((long)offset, directData, 0, (int)size);
             return directData;
         }
 
@@ -259,8 +267,6 @@ public class IoStoreReader : IDisposable
             int compressedSize = (int)block.CompressedSize;
             int uncompressedSize = (int)block.UncompressedSize;
 
-            _casStream!.Seek((long)block.Offset, SeekOrigin.Begin);
-
             byte compressionMethodIndex = block.CompressionMethodIndex;
 
             if (compressionMethodIndex == 0)
@@ -270,13 +276,13 @@ public class IoStoreReader : IDisposable
                 {
                     int alignedSize = AlignUSize(uncompressedSize, 16);
                     byte[] encryptedData = new byte[alignedSize];
-                    _casStream.ReadExactly(encryptedData, 0, alignedSize);
+                    ReadAt((long)block.Offset, encryptedData, 0, alignedSize);
                     DecryptAes(encryptedData, _aesKey);
                     Array.Copy(encryptedData, 0, data2, cur, uncompressedSize);
                 }
                 else
                 {
-                    _casStream.ReadExactly(data2, cur, uncompressedSize);
+                    ReadAt((long)block.Offset, data2, cur, uncompressedSize);
                 }
             }
             else
@@ -287,14 +293,14 @@ public class IoStoreReader : IDisposable
                 {
                     int alignedSize = AlignUSize(compressedSize, 16);
                     compressedData = new byte[alignedSize];
-                    _casStream.ReadExactly(compressedData, 0, alignedSize);
+                    ReadAt((long)block.Offset, compressedData, 0, alignedSize);
                     DecryptAes(compressedData, _aesKey);
                     compressedData = compressedData[..compressedSize];
                 }
                 else
                 {
                     compressedData = new byte[compressedSize];
-                    _casStream.ReadExactly(compressedData, 0, compressedSize);
+                    ReadAt((long)block.Offset, compressedData, 0, compressedSize);
                 }
 
                 string? compressionMethod = _toc.CompressionMethods.Count > compressionMethodIndex - 1
@@ -374,7 +380,15 @@ public class IoStoreReader : IDisposable
 
     private void EnsureCasOpen()
     {
-        _casStream ??= new FileStream(_ucasPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (_casHandle != null) return; // fast path (handle set atomically after stream)
+        lock (_casOpenLock)
+        {
+            if (_casStream == null)
+            {
+                _casStream = new FileStream(_ucasPath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 1, useAsync: false);
+                _casHandle = _casStream.SafeFileHandle; // volatile-like: assigned last so fast path is safe
+            }
+        }
     }
 
     private static ulong AlignU64(ulong value, uint alignment)
@@ -444,6 +458,7 @@ public class IoStoreReader : IDisposable
     {
         _casStream?.Dispose();
         _casStream = null;
+        _casHandle = null;
     }
 }
 

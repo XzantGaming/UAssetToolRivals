@@ -35,3 +35,33 @@ public struct FIntVector : ICloneable
 
     public object Clone() => new FIntVector(X, Y, Z);
 }
+
+/// <summary>
+/// Structure for integer vectors in 2-d space.
+/// </summary>
+public struct FIntVector2 : ICloneable
+{
+    public int X;
+    public int Y;
+
+    public FIntVector2(int x, int y)
+    {
+        X = x;
+        Y = y;
+    }
+
+    public FIntVector2(AssetBinaryReader reader)
+    {
+        X = reader.ReadInt32();
+        Y = reader.ReadInt32();
+    }
+
+    public int Write(AssetBinaryWriter writer)
+    {
+        writer.Write(X);
+        writer.Write(Y);
+        return sizeof(int) * 2;
+    }
+
+    public object Clone() => new FIntVector2(X, Y);
+}
