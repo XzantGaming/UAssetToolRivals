@@ -56,7 +56,7 @@ public class ZenConverter
     /// </summary>
     public static bool TryLoadScriptObjectsDatabase(string? path = null)
     {
-        string dbPath = path ?? @"E:\WindsurfCoding\repak_rivals-remastered\ScriptObjectExportTest\ScriptObjects.bin";
+        string dbPath = path ?? Path.Combine(AppContext.BaseDirectory, "ScriptObjects.bin");
         if (File.Exists(dbPath))
         {
             try
