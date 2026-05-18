@@ -21,6 +21,9 @@ public class FZenPackageContext : IDisposable
     private readonly Dictionary<ulong, string> _packageIdToPath = new(); // PackageId -> full package path
     private readonly Dictionary<ulong, List<ulong>> _packageExportHashes = new(); // PackageId -> list of public export hashes
     private readonly Dictionary<int, List<string>> _containerNameMaps = new(); // ContainerIndex -> global name map
+    // Per-package export hash lookup: packageId -> (cityHash64(lowerName) -> exportIndex)
+    // Built once on first use, eliminates O(N) linear scan in ResolvePackageImport
+    private readonly ConcurrentDictionary<ulong, Dictionary<ulong, int>> _exportHashLookup = new();
     
     public ScriptObjectsDatabase? ScriptObjects { get; private set; }
     public EIoContainerHeaderVersion ContainerHeaderVersion { get; private set; } = EIoContainerHeaderVersion.NoExportInfo;
@@ -764,12 +767,41 @@ public class FZenPackageContext : IDisposable
     }
 
     /// <summary>
+    /// Get the export index in a package by its CityHash64(lowerName) hash.
+    /// Builds and caches a hash→index dictionary on first call per package.
+    /// Returns -1 if not found.
+    /// </summary>
+    public int GetExportIndexByHash(ulong packageId, ulong exportHash, ScriptObjectsDatabase? scriptObjects)
+    {
+        var lookup = _exportHashLookup.GetOrAdd(packageId, pkgId =>
+        {
+            if (!_packageCache.TryGetValue(pkgId, out var cached))
+                return new Dictionary<ulong, int>();
+            var map = new Dictionary<ulong, int>(cached.Header.ExportMap.Count);
+            for (int i = 0; i < cached.Header.ExportMap.Count; i++)
+            {
+                var exp = cached.Header.ExportMap[i];
+                // Direct hash stored on export (older UE5)
+                if (exp.PublicExportHash != 0)
+                    map.TryAdd(exp.PublicExportHash, i);
+                // CityHash64 of lowercase name (UE5.3+ NoExportInfo)
+                string name = cached.Header.GetName(exp.ObjectName, scriptObjects);
+                ulong computed = IoStore.CityHash.CityHash64(name.ToLowerInvariant());
+                map.TryAdd(computed, i);
+            }
+            return map;
+        });
+        return lookup.TryGetValue(exportHash, out int idx) ? idx : -1;
+    }
+
+    /// <summary>
     /// Clear the package cache to free memory
     /// </summary>
     public void ClearCache()
     {
         _packageCache.Clear();
         _packageExportHashes.Clear();
+        _exportHashLookup.Clear();
     }
 
     public void Dispose()
@@ -781,6 +813,7 @@ public class FZenPackageContext : IDisposable
         _containers.Clear();
         _packageCache.Clear();
         _packageExportHashes.Clear();
+        _exportHashLookup.Clear();
     }
 }
 

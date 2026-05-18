@@ -1303,96 +1303,58 @@ public class ZenToLegacyConverter
                 {
                     ulong exportHash = _zenPackage.ImportedPublicExportHashes[packageImport.ImportedPublicExportHashIndex];
                     
-                    // Search for export with matching hash in target package
-                    // NOTE: In UE5.3+ (NoExportInfo), FExportMapEntry.PublicExportHash is actually a
-                    // GlobalImportIndex (FPackageObjectIndex), NOT a CityHash64 hash. But
-                    // ImportedPublicExportHashes contains actual CityHash64 hashes of export names.
-                    // So we must compute CityHash64 of each export's name and compare that.
-                    bool foundExport = false;
-                    foreach (var export in targetPackage.ExportMap)
-                    {
-                        // Try direct hash match first (works for older UE5 versions)
-                        // Then try CityHash64 of export name (required for UE5.3+ NoExportInfo)
-                        string expName = targetPackage.GetName(export.ObjectName, _scriptObjects);
-                        ulong computedHash = IoStore.CityHash.CityHash64(expName.ToLowerInvariant());
-                        
-                        if (export.PublicExportHash == exportHash || computedHash == exportHash)
-                        {
-                            foundExport = true;
-                            // Debug: Check what name we're getting
-                            if (_debugMode)
-                            {
-                                Console.Error.WriteLine($"[DEBUG] Resolving export from {packageName}:");
-                                Console.Error.WriteLine($"  ObjectName.Index={export.ObjectName.Index}, Type={export.ObjectName.Type}");
-                                Console.Error.WriteLine($"  TargetPackage.NameMap.Count={targetPackage.NameMap.Count}");
-                                if (export.ObjectName.Index < targetPackage.NameMap.Count)
-                                    Console.Error.WriteLine($"  Name at index={targetPackage.NameMap[(int)export.ObjectName.Index]}");
-                            }
-                            
-                            // Get base name and FName number separately
-                            var (exportBaseName, exportNumber) = GetExportBaseNameAndNumber(targetPackage, export.ObjectName);
-
-                            // Resolve the class of this export (handles script imports,
-                            // package imports AND local exports - e.g. BP-generated classes)
-                            var (className, classPackage) = ResolveExportClassInfo(targetPackage, export.ClassIndex);
-
-                            // Build the resolved import with proper class info
-                            return new ResolvedZenImport
-                            {
-                                ClassPackage = classPackage,
-                                ClassName = className,
-                                ObjectName = exportBaseName,
-                                ObjectNameNumber = exportNumber,
-                                Outer = packageOuter
-                            };
-                        }
-                    }
+                    // O(1) lookup via cached hash→exportIndex dictionary (built once per package).
+                    // Replaces the old O(N) foreach that called CityHash64 on every export per lookup.
+                    int foundExportIdx = _context.GetExportIndexByHash(importedPackageId, exportHash, _scriptObjects);
                     
-                    if (!foundExport)
+                    if (foundExportIdx >= 0)
+                    {
+                        var export = targetPackage.ExportMap[foundExportIdx];
+
+                        if (_debugMode)
+                        {
+                            Console.Error.WriteLine($"[DEBUG] Resolving export from {packageName}:");
+                            Console.Error.WriteLine($"  ObjectName.Index={export.ObjectName.Index}, Type={export.ObjectName.Type}");
+                            if (export.ObjectName.Index < targetPackage.NameMap.Count)
+                                Console.Error.WriteLine($"  Name at index={targetPackage.NameMap[(int)export.ObjectName.Index]}");
+                        }
+
+                        var (exportBaseName, exportNumber) = GetExportBaseNameAndNumber(targetPackage, export.ObjectName);
+                        var (className, classPackage) = ResolveExportClassInfo(targetPackage, export.ClassIndex);
+
+                        return new ResolvedZenImport
+                        {
+                            ClassPackage = classPackage,
+                            ClassName = className,
+                            ObjectName = exportBaseName,
+                            ObjectNameNumber = exportNumber,
+                            Outer = packageOuter
+                        };
+                    }
+                    else
                     {
                         if (_debugMode)
                         {
                             Console.Error.WriteLine($"[DEBUG] Export hash not found: {exportHash:X16} in {packageName} (has {targetPackage.ExportMap.Count} exports)");
-                            foreach (var exp in targetPackage.ExportMap)
-                            {
-                                string expNameDbg = targetPackage.GetName(exp.ObjectName, _scriptObjects);
-                                Console.Error.WriteLine($"  Export: hash={exp.PublicExportHash:X16}, name={expNameDbg}");
-                            }
                         }
-                        
+
                         // Fallback: if only one export, use it directly
                         if (targetPackage.ExportMap.Count == 1)
                         {
                             var export = targetPackage.ExportMap[0];
                             var (fbBaseName, fbNumber) = GetExportBaseNameAndNumber(targetPackage, export.ObjectName);
-                            var (className, classPackage) = ResolveExportClassInfo(targetPackage, export.ClassIndex);
-
-                            return new ResolvedZenImport
-                            {
-                                ClassPackage = classPackage,
-                                ClassName = className,
-                                ObjectName = fbBaseName,
-                                ObjectNameNumber = fbNumber,
-                                Outer = packageOuter
-                            };
+                            var (fbClassName, fbClassPackage) = ResolveExportClassInfo(targetPackage, export.ClassIndex);
+                            return new ResolvedZenImport { ClassPackage = fbClassPackage, ClassName = fbClassName, ObjectName = fbBaseName, ObjectNameNumber = fbNumber, Outer = packageOuter };
                         }
-                        
-                        // Fallback: use export hash index to pick an export if within range
+
+                        // Fallback: use hash index positionally
                         int exportIdx = (int)packageImport.ImportedPublicExportHashIndex;
                         if (exportIdx < targetPackage.ExportMap.Count)
                         {
                             var export = targetPackage.ExportMap[exportIdx];
                             var (fb2BaseName, fb2Number) = GetExportBaseNameAndNumber(targetPackage, export.ObjectName);
-                            var (className, classPackage) = ResolveExportClassInfo(targetPackage, export.ClassIndex);
-
-                            return new ResolvedZenImport
-                            {
-                                ClassPackage = classPackage,
-                                ClassName = className,
-                                ObjectName = fb2BaseName,
-                                ObjectNameNumber = fb2Number,
-                                Outer = packageOuter
-                            };
+                            var (fb2ClassName, fb2ClassPackage) = ResolveExportClassInfo(targetPackage, export.ClassIndex);
+                            return new ResolvedZenImport { ClassPackage = fb2ClassPackage, ClassName = fb2ClassName, ObjectName = fb2BaseName, ObjectNameNumber = fb2Number, Outer = packageOuter };
                         }
                     }
                 }

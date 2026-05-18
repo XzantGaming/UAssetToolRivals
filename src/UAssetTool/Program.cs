@@ -1557,17 +1557,24 @@ public partial class Program
 
                     extractedPackages.TryAdd(packageId, true);
                     Interlocked.Increment(ref converted);
-                    Console.WriteLine($"{prefix}Converted: {packageName}");
+                    if (debugMode)
+                        Console.WriteLine($"{prefix}Converted: {packageName}");
                 }
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref failed);
-                    Console.Error.WriteLine($"Failed to convert {packageName}: {ex.Message}");
+                    Console.Error.WriteLine($"  Failed: {packageName}: {ex.Message}");
                     if (debugMode) Console.Error.WriteLine(ex.StackTrace);
                 }
 
                 return imports;
             }
+
+            // Pre-load all packages into the cache sequentially before parallel conversion.
+            // Retoc does the same (FZenPackageContext::create pre-populates the cache).
+            // This avoids I/O contention during the parallel phase: Convert() only needs CPU.
+            foreach (var packageId in packageIds)
+                context.GetPackage(packageId);
 
             // Process primary packages in parallel (each ZenToLegacyConverter is independent)
             var allImports = new System.Collections.Concurrent.ConcurrentBag<ulong>();
