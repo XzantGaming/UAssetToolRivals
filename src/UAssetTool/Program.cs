@@ -5873,7 +5873,7 @@ public partial class Program
                 // Get packages from mod container
                 var modPackageIds = context.GetPackageIdsFromContainer(modContainerIndex);
                 packagesToExtract.AddRange(modPackageIds);
-                Console.Error.WriteLine($"[ExtractIoStoreLegacy] Found {modPackageIds.Count} packages in mod container");
+                Console.Error.WriteLine($"[ExtractIoStoreLegacy] Found {modPackageIds.Count()} packages in mod container");
             }
             else
             {
@@ -5901,7 +5901,7 @@ public partial class Program
                     if (matches) filtered.Add(packageId);
                 }
                 packagesToExtract = filtered;
-                Console.Error.WriteLine($"[ExtractIoStoreLegacy] Filtered to {packagesToExtract.Count} packages matching patterns");
+                Console.Error.WriteLine($"[ExtractIoStoreLegacy] Filtered to {packagesToExtract.Count()} packages matching patterns");
             }
 
             // Extract packages
@@ -6084,14 +6084,8 @@ public partial class Program
 
             try
             {
-                // Parse AES key
-                byte[]? pakAesKey = null;
-                if (!string.IsNullOrEmpty(aesKey))
-                {
-                    pakAesKey = ParseAesKey(aesKey);
-                }
-
-                using var pakReader = new IoStore.PakReader(inputPak, pakAesKey);
+                // PakReader takes AES key as string (hex), not byte array
+                using var pakReader = new IoStore.PakReader(inputPak, aesKey);
                 int extracted = 0;
                 foreach (var file in pakReader.Files)
                 {
@@ -6596,12 +6590,6 @@ public class UAssetRequest
     /// </summary>
     [JsonPropertyName("base_path")]
     public string? BasePath { get; set; }
-
-    /// <summary>
-    /// Filter patterns for extract_iostore_legacy (e.g., ["SK_1014", "Characters/1014"])
-    /// </summary>
-    [JsonPropertyName("filter_patterns")]
-    public List<string>? FilterPatterns { get; set; }
 
     /// <summary>
     /// Game Paks directory path for extract_iostore_legacy
