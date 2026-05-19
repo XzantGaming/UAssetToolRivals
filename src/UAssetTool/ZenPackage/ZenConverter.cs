@@ -255,7 +255,24 @@ public class ZenConverter
                 // DO NOT re-serialize! Re-serialization would add 4-byte ObjectGuid booleans to
                 // inner objects like MorphTargets, causing serial size mismatches.
                 // Files extracted from IoStore already have correct format - pass through raw data.
-                if (skeletalExport.SourceHadGameplayTags)
+                //
+                // Also check for single-material meshes where detection failed:
+                // If _originalMaterialsByteLength > 4 + (40 * materialCount), padding already exists.
+                bool hasGameplayTags = skeletalExport.SourceHadGameplayTags;
+                if (!hasGameplayTags && skeletalExport.Materials?.Count > 0)
+                {
+                    int expectedLenNoTags = 4 + (40 * skeletalExport.Materials.Count);  // count + 40 bytes per mat
+                    int expectedLenWithTags = 4 + (44 * skeletalExport.Materials.Count); // count + 44 bytes per mat
+                    int actualLen = skeletalExport.GetOriginalMaterialsByteLength();
+
+                    // If actual length matches or exceeds the "with tags" size, padding is present
+                    if (actualLen >= expectedLenWithTags)
+                    {
+                        hasGameplayTags = true;
+                    }
+                }
+                
+                if (hasGameplayTags)
                 {
                     // Source already has correct format - no re-serialization needed
                     // Just use the original uexpData as-is

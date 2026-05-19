@@ -80,6 +80,12 @@ namespace UAssetAPI.ExportTypes
         /// </summary>
         public bool SourceHadGameplayTags => _sourceHadGameplayTags;
 
+        /// <summary>
+        /// Gets the original byte length of the materials section in the Extras data.
+        /// This can be used to detect if FGameplayTagContainer padding is already present.
+        /// </summary>
+        public int GetOriginalMaterialsByteLength() => _originalMaterialsByteLength;
+
         #endregion
 
         #region Constructors
@@ -175,9 +181,9 @@ namespace UAssetAPI.ExportTypes
                     // Try to detect if materials have FGameplayTagContainer by checking structure
                     // Legacy format: 40 bytes per material
                     // With FGameplayTagContainer: 44+ bytes per material (44 for empty container)
-                    bool hasGameplayTags = DetectGameplayTagsInMaterials(extraReader, materialCount);
+                    bool hasGameplayTags = DetectGameplayTagsInMaterials(extraReader, materialCount, Extras.Length);
                     _sourceHadGameplayTags = hasGameplayTags;
-                    
+
                     Materials = new List<FSkeletalMaterial>(materialCount);
                     for (int i = 0; i < materialCount; i++)
                     {
@@ -531,14 +537,42 @@ namespace UAssetAPI.ExportTypes
         /// Detect if materials in the extra data have FGameplayTagContainer by checking structure.
         /// This is done by reading ahead and checking if the pattern matches 40-byte or 44-byte materials.
         /// </summary>
-        private bool DetectGameplayTagsInMaterials(AssetBinaryReader reader, int materialCount)
+        private bool DetectGameplayTagsInMaterials(AssetBinaryReader reader, int materialCount, long extrasLength)
         {
-            if (materialCount < 2) return false; // Need at least 2 materials to detect pattern
-            
             long startPos = reader.BaseStream.Position;
             
             try
             {
+                // Special case: single material
+                // Check what comes AFTER the material - should be FReferenceSkeleton starting with bone count
+                // If we see count=0 at +40 and bone count at +44, GameplayTagContainer is present
+                if (materialCount == 1)
+                {
+                    // Need 48 bytes to check: 40 for material + 4 for potential tag count + 4 for next value
+                    if (startPos + 48 > extrasLength)
+                    {
+                        return false;
+                    }
+                    
+                    // Read at offset +40 from material start (after one 40-byte material)
+                    reader.BaseStream.Position = startPos + 40;
+                    int tagCountOrBoneCount = reader.ReadInt32();
+                    int nextValue = reader.ReadInt32();
+                    
+                    // If +40 is 0 and +44 looks like a bone count (positive, reasonable), we have tags
+                    // Bone counts are typically 1-300 for Marvel Rivals characters
+                    if (tagCountOrBoneCount == 0 && nextValue > 0 && nextValue < 1000)
+                    {
+                        return true;
+                    }
+                    // If +40 is a positive number (bone count), no tags present
+                    // If +40 is negative (would be unexpected), no tags
+                    return false;
+                }
+                
+                // Multi-material case: need at least 2 materials to detect pattern
+                if (materialCount < 2) return false;
+                
                 // Read first material without tags (40 bytes)
                 // FPackageIndex (4) + FName (8) + FName (8) + FMeshUVChannelInfo (20) = 40 bytes
                 int firstPkgIdx = reader.ReadInt32(); // MaterialInterface
