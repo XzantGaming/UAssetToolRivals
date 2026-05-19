@@ -2572,8 +2572,9 @@ public partial class Program
                 "is_iostore_encrypted" => IsIoStoreEncrypted(request.FilePath),
                 "recompress_iostore" => RecompressIoStore(request.FilePath),
                 "extract_iostore" => ExtractIoStoreJson(request.FilePath, request.OutputPath, request.AesKey),
+                "extract_iostore_legacy" => ExtractIoStoreLegacyJson(request.GamePaks, request.ModPath, request.OutputPath, request.FilterPatterns, request.AesKey, request.WithDeps),
                 "extract_script_objects" => ExtractScriptObjectsJson(request.FilePath, request.OutputPath),
-                "create_mod_iostore" => CreateModIoStoreJson(request.OutputPath, request.InputDir, request.MountPoint, request.Compress, request.AesKey, request.Parallel, request.Obfuscate),
+                "create_mod_iostore" => CreateModIoStoreJson(request.OutputPath, request.InputDir, request.InputPak, request.MountPoint, request.Compress, request.AesKey, request.Parallel, request.Obfuscate),
                 
                 // Additional CLI-equivalent operations for parity
                 "dump" => DumpAssetJson(request.FilePath, request.UsmapPath),
@@ -5790,7 +5791,218 @@ public partial class Program
             return new UAssetResponse { Success = false, Message = $"Failed to extract IoStore: {ex.Message}" };
         }
     }
-    
+
+    /// <summary>
+    /// Extract IoStore to legacy format with game paks context (VFX pipeline compatible)
+    /// JSON API equivalent of CliExtractIoStoreLegacy
+    /// </summary>
+    private static UAssetResponse ExtractIoStoreLegacyJson(string? gamePaks, string? modPath, string? outputPath, List<string>? filterPatterns, string? aesKeyHex, bool withDeps)
+    {
+        if (string.IsNullOrEmpty(gamePaks))
+            return new UAssetResponse { Success = false, Message = "game_paks is required" };
+        if (string.IsNullOrEmpty(outputPath))
+            return new UAssetResponse { Success = false, Message = "output_path is required" };
+
+        if (!Directory.Exists(gamePaks))
+            return new UAssetResponse { Success = false, Message = $"Game Paks directory not found: {gamePaks}" };
+
+        try
+        {
+            Directory.CreateDirectory(outputPath);
+
+            // Create package context for proper import resolution
+            using var context = new ZenPackage.FZenPackageContext();
+
+            // Set AES key - use provided key or default Marvel Rivals key
+            string aesKey = string.IsNullOrEmpty(aesKeyHex)
+                ? "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74"
+                : aesKeyHex;
+            context.SetAesKey(aesKey);
+
+            Console.Error.WriteLine($"[ExtractIoStoreLegacy] Loading game containers from: {gamePaks}");
+
+            // Load global.utoc first for script objects
+            string globalPath = Path.Combine(gamePaks, "global.utoc");
+            if (File.Exists(globalPath))
+            {
+                Console.Error.WriteLine("[ExtractIoStoreLegacy] Loading global.utoc...");
+                context.LoadContainer(globalPath);
+                context.LoadScriptObjectsFromContainer(0);
+            }
+
+            // Load other game containers
+            var utocFiles = Directory.GetFiles(gamePaks, "*.utoc", SearchOption.TopDirectoryOnly)
+                .Where(f => !f.EndsWith("global.utoc", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(f => f)
+                .ToList();
+
+            Console.Error.WriteLine($"[ExtractIoStoreLegacy] Loading {utocFiles.Count} game containers...");
+            foreach (var utocFile in utocFiles)
+            {
+                try { context.LoadContainer(utocFile); }
+                catch (Exception ex) { Console.Error.WriteLine($"  Warning: Failed to load {Path.GetFileName(utocFile)}: {ex.Message}"); }
+            }
+
+            // Load mod containers if specified
+            int modContainerIndex = -1;
+            if (!string.IsNullOrEmpty(modPath))
+            {
+                if (File.Exists(modPath) && modPath.EndsWith(".utoc", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.Error.WriteLine($"[ExtractIoStoreLegacy] Loading mod container: {modPath}");
+                    modContainerIndex = context.ContainerCount;
+                    context.LoadContainerWithPriority(modPath);
+                }
+                else if (Directory.Exists(modPath))
+                {
+                    var modUtocs = Directory.GetFiles(modPath, "*.utoc", SearchOption.TopDirectoryOnly);
+                    foreach (var modUtoc in modUtocs)
+                    {
+                        Console.Error.WriteLine($"[ExtractIoStoreLegacy] Loading mod container: {modUtoc}");
+                        modContainerIndex = context.ContainerCount;
+                        context.LoadContainerWithPriority(modUtoc);
+                    }
+                }
+            }
+
+            // Determine which packages to extract
+            var packagesToExtract = new List<ulong>();
+
+            if (modContainerIndex >= 0)
+            {
+                // Get packages from mod container
+                var modPackageIds = context.GetPackageIdsFromContainer(modContainerIndex);
+                packagesToExtract.AddRange(modPackageIds);
+                Console.Error.WriteLine($"[ExtractIoStoreLegacy] Found {modPackageIds.Count} packages in mod container");
+            }
+            else
+            {
+                // Get all packages from all containers
+                for (int i = 0; i < context.ContainerCount; i++)
+                {
+                    var packageIds = context.GetPackageIdsFromContainer(i);
+                    packagesToExtract.AddRange(packageIds);
+                }
+            }
+
+            // Apply filter patterns if specified
+            if (filterPatterns != null && filterPatterns.Count > 0)
+            {
+                var filtered = new List<ulong>();
+                foreach (var packageId in packagesToExtract)
+                {
+                    string? path = context.GetPackagePath(packageId);
+                    if (string.IsNullOrEmpty(path)) continue;
+
+                    // Check if path matches any filter pattern
+                    bool matches = filterPatterns.Any(pattern =>
+                        path.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+
+                    if (matches) filtered.Add(packageId);
+                }
+                packagesToExtract = filtered;
+                Console.Error.WriteLine($"[ExtractIoStoreLegacy] Filtered to {packagesToExtract.Count} packages matching patterns");
+            }
+
+            // Extract packages
+            int converted = 0;
+            int failed = 0;
+            var extractedFiles = new List<string>();
+
+            foreach (var packageId in packagesToExtract)
+            {
+                string? fullPath = context.GetPackagePath(packageId);
+                var cached = context.GetCachedPackage(packageId);
+                if (cached == null) continue;
+
+                string packageName = !string.IsNullOrEmpty(fullPath) ? fullPath : cached.Header.PackageName();
+
+                try
+                {
+                    var converter = new ZenPackage.ZenToLegacyConverter(context, packageId);
+                    var legacyBundle = converter.Convert();
+
+                    // Resolve path and write files (same logic as ExtractIoStoreJson)
+                    string relPath = packageName;
+                    if (relPath.Contains("/../"))
+                    {
+                        string tempRoot = Path.GetTempPath();
+                        string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                        string resolved = Path.GetFullPath(tempPath);
+                        relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
+                        if (!relPath.StartsWith("/"))
+                            relPath = "/" + relPath;
+                        int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+                        if (contentIdx >= 0)
+                            relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
+                    }
+
+                    relPath = ResolveGamePathToContent(relPath);
+                    relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
+                    if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
+                        relPath += ".uasset";
+
+                    string outputAssetPath = Path.Combine(outputPath, relPath);
+                    string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
+                    if (!string.IsNullOrEmpty(outputAssetDir))
+                        Directory.CreateDirectory(outputAssetDir);
+
+                    File.WriteAllBytes(outputAssetPath, legacyBundle.AssetData);
+                    extractedFiles.Add(relPath);
+
+                    string outputUexpPath = Path.ChangeExtension(outputAssetPath, ".uexp");
+                    File.WriteAllBytes(outputUexpPath, legacyBundle.ExportsData);
+                    extractedFiles.Add(Path.ChangeExtension(relPath, ".uexp"));
+
+                    if (legacyBundle.BulkData != null && legacyBundle.BulkData.Length > 0)
+                    {
+                        string outputBulkPath = Path.ChangeExtension(outputAssetPath, ".ubulk");
+                        File.WriteAllBytes(outputBulkPath, legacyBundle.BulkData);
+                        extractedFiles.Add(Path.ChangeExtension(relPath, ".ubulk"));
+                    }
+
+                    if (legacyBundle.OptionalBulkData != null && legacyBundle.OptionalBulkData.Length > 0)
+                    {
+                        string outputUptnlPath = Path.ChangeExtension(outputAssetPath, ".uptnl");
+                        File.WriteAllBytes(outputUptnlPath, legacyBundle.OptionalBulkData);
+                        extractedFiles.Add(Path.ChangeExtension(relPath, ".uptnl"));
+                    }
+
+                    if (legacyBundle.MemoryMappedBulkData != null && legacyBundle.MemoryMappedBulkData.Length > 0)
+                    {
+                        string outputMBulkPath = Path.ChangeExtension(outputAssetPath, ".m.ubulk");
+                        File.WriteAllBytes(outputMBulkPath, legacyBundle.MemoryMappedBulkData);
+                        extractedFiles.Add(Path.ChangeExtension(relPath, ".m.ubulk"));
+                    }
+
+                    converted++;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ExtractIoStoreLegacy] Failed to convert {packageName}: {ex.Message}");
+                    failed++;
+                }
+            }
+
+            return new UAssetResponse
+            {
+                Success = true,
+                Message = $"Extracted {converted} packages from IoStore ({failed} failed)",
+                Data = new Dictionary<string, object?>
+                {
+                    ["extracted_count"] = converted,
+                    ["failed_count"] = failed,
+                    ["output_dir"] = outputPath,
+                    ["files"] = extractedFiles
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            return new UAssetResponse { Success = false, Message = $"Failed to extract IoStore (legacy): {ex.Message}" };
+        }
+    }
+
     /// <summary>
     /// Extract ScriptObjects.bin from game paks
     /// </summary>
@@ -5839,36 +6051,103 @@ public partial class Program
     /// Create a mod IoStore bundle from a directory of legacy assets.
     /// This is the JSON API equivalent of retoc's action_to_zen.
     /// Converts .uasset/.uexp files to Zen format and creates .utoc/.ucas/.pak bundle.
+    /// Supports direct .pak file input (input_pak) as an alternative to input_dir.
     /// </summary>
-    private static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? mountPoint, bool compress, string? aesKey, bool parallel, bool obfuscate)
+    private static UAssetResponse CreateModIoStoreJson(string? outputPath, string? inputDir, string? inputPak, string? mountPoint, bool compress, string? aesKey, bool parallel, bool obfuscate)
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
-        if (string.IsNullOrEmpty(inputDir))
-            return new UAssetResponse { Success = false, Message = "Input directory is required" };
-        
+
         // Marvel Rivals AES key for obfuscation
         const string MARVEL_RIVALS_AES_KEY = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
-        
+
         // If obfuscate is enabled, use the game's AES key
         if (obfuscate)
         {
             aesKey = MARVEL_RIVALS_AES_KEY;
         }
-        
-        if (!Directory.Exists(inputDir))
-            return new UAssetResponse { Success = false, Message = $"Input directory not found: {inputDir}" };
+
+        string? effectiveInputDir = inputDir;
+        string? tempExtractDir = null;
+
+        // Handle PAK file input - extract to temp directory first
+        if (!string.IsNullOrEmpty(inputPak))
+        {
+            if (!File.Exists(inputPak))
+                return new UAssetResponse { Success = false, Message = $"Input PAK file not found: {inputPak}" };
+
+            tempExtractDir = Path.Combine(Path.GetTempPath(), "UAssetTool_pak_" + Path.GetFileNameWithoutExtension(inputPak) + "_" + Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(tempExtractDir);
+
+            Console.Error.WriteLine($"[CreateModIoStore] Extracting PAK file: {inputPak}");
+            Console.Error.WriteLine($"[CreateModIoStore] Temp extraction dir: {tempExtractDir}");
+
+            try
+            {
+                // Parse AES key
+                byte[]? pakAesKey = null;
+                if (!string.IsNullOrEmpty(aesKey))
+                {
+                    pakAesKey = ParseAesKey(aesKey);
+                }
+
+                using var pakReader = new IoStore.PakReader(inputPak, pakAesKey);
+                int extracted = 0;
+                foreach (var file in pakReader.Files)
+                {
+                    try
+                    {
+                        // Skip non-asset files
+                        if (!file.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
+                            !file.EndsWith(".uexp", StringComparison.OrdinalIgnoreCase) &&
+                            !file.EndsWith(".ubulk", StringComparison.OrdinalIgnoreCase) &&
+                            !file.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        byte[] data = pakReader.Get(file);
+                        string destPath = Path.Combine(tempExtractDir, file.Replace('/', Path.DirectorySeparatorChar));
+                        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                        File.WriteAllBytes(destPath, data);
+                        extracted++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[CreateModIoStore] Failed to extract {file}: {ex.Message}");
+                    }
+                }
+
+                Console.Error.WriteLine($"[CreateModIoStore] Extracted {extracted} files from PAK");
+                effectiveInputDir = tempExtractDir;
+            }
+            catch (Exception ex)
+            {
+                // Cleanup temp dir on failure
+                try { if (Directory.Exists(tempExtractDir)) Directory.Delete(tempExtractDir, true); } catch { }
+                return new UAssetResponse { Success = false, Message = $"Failed to extract PAK file: {ex.Message}" };
+            }
+        }
+
+        if (string.IsNullOrEmpty(effectiveInputDir))
+            return new UAssetResponse { Success = false, Message = "Either input_dir or input_pak is required" };
+
+        if (!Directory.Exists(effectiveInputDir))
+            return new UAssetResponse { Success = false, Message = $"Input directory not found: {effectiveInputDir}" };
         
         try
         {
             // Collect all uasset files
-            var uassetFiles = Directory.GetFiles(inputDir, "*.uasset", SearchOption.AllDirectories).ToList();
-            
+            var uassetFiles = Directory.GetFiles(effectiveInputDir, "*.uasset", SearchOption.AllDirectories).ToList();
+
             // Collect shader bytecode files
-            var shaderFiles = Directory.GetFiles(inputDir, "*.ushaderbytecode", SearchOption.AllDirectories).ToList();
+            var shaderFiles = Directory.GetFiles(effectiveInputDir, "*.ushaderbytecode", SearchOption.AllDirectories).ToList();
             
             if (uassetFiles.Count == 0 && shaderFiles.Count == 0)
+            {
+                // Cleanup temp dir if we created one
+                if (!string.IsNullOrEmpty(tempExtractDir) && Directory.Exists(tempExtractDir))
+                    try { Directory.Delete(tempExtractDir, true); } catch { }
                 return new UAssetResponse { Success = false, Message = "No .uasset or .ushaderbytecode files found in input directory" };
+            }
             
             if (shaderFiles.Count > 0)
                 Console.Error.WriteLine($"[CreateModIoStore] Found {shaderFiles.Count} shader library file(s)");
@@ -6034,7 +6313,7 @@ public partial class Program
                     byte[] shaderData = File.ReadAllBytes(shaderFile);
                     
                     // Determine the UE package path from the file's relative path within the input directory
-                    string relativePath = Path.GetRelativePath(inputDir, shaderFile).Replace('\\', '/');
+                    string relativePath = Path.GetRelativePath(effectiveInputDir, shaderFile).Replace('\\', '/');
                     // Strip any leading "Marvel/Content/" prefix if already present, otherwise prefix with mount-relative path
                     string shaderLibPath;
                     if (relativePath.StartsWith("Marvel/Content/", StringComparison.OrdinalIgnoreCase))
@@ -6067,6 +6346,9 @@ public partial class Program
                 ioStoreWriter.Dispose();
                 try { File.Delete(utocPath); } catch { }
                 try { File.Delete(Path.ChangeExtension(utocPath, ".ucas")); } catch { }
+                // Cleanup temp dir if we created one
+                if (!string.IsNullOrEmpty(tempExtractDir) && Directory.Exists(tempExtractDir))
+                    try { Directory.Delete(tempExtractDir, true); } catch { }
                 return new UAssetResponse { Success = false, Message = $"No assets were converted. Errors: {string.Join("; ", errors)}" };
             }
             
@@ -6078,6 +6360,20 @@ public partial class Program
             // Resolve file paths to Marvel/Content/ format for the app
             var resolvedFilePaths = filePaths.Select(p => ResolveGamePathToContent(p)).ToList();
             
+            // Cleanup temp extraction directory if we created one
+            if (!string.IsNullOrEmpty(tempExtractDir) && Directory.Exists(tempExtractDir))
+            {
+                try
+                {
+                    Directory.Delete(tempExtractDir, true);
+                    Console.Error.WriteLine($"[CreateModIoStore] Cleaned up temp directory: {tempExtractDir}");
+                }
+                catch (Exception cleanupEx)
+                {
+                    Console.Error.WriteLine($"[CreateModIoStore] Warning: Failed to cleanup temp directory: {cleanupEx.Message}");
+                }
+            }
+
             return new UAssetResponse
             {
                 Success = true,
@@ -6096,6 +6392,9 @@ public partial class Program
         }
         catch (Exception ex)
         {
+            // Cleanup temp dir on any exception
+            if (!string.IsNullOrEmpty(tempExtractDir) && Directory.Exists(tempExtractDir))
+                try { Directory.Delete(tempExtractDir, true); } catch { }
             return new UAssetResponse { Success = false, Message = $"Failed to create mod IoStore: {ex.Message}" };
         }
     }
@@ -6248,7 +6547,13 @@ public class UAssetRequest
     
     [JsonPropertyName("input_dir")]
     public string? InputDir { get; set; }
-    
+
+    /// <summary>
+    /// Path to a .pak file to extract and use as input (alternative to input_dir)
+    /// </summary>
+    [JsonPropertyName("input_pak")]
+    public string? InputPak { get; set; }
+
     [JsonPropertyName("compress")]
     public bool Compress { get; set; } = true;
     
@@ -6291,6 +6596,30 @@ public class UAssetRequest
     /// </summary>
     [JsonPropertyName("base_path")]
     public string? BasePath { get; set; }
+
+    /// <summary>
+    /// Filter patterns for extract_iostore_legacy (e.g., ["SK_1014", "Characters/1014"])
+    /// </summary>
+    [JsonPropertyName("filter_patterns")]
+    public List<string>? FilterPatterns { get; set; }
+
+    /// <summary>
+    /// Game Paks directory path for extract_iostore_legacy
+    /// </summary>
+    [JsonPropertyName("game_paks")]
+    public string? GamePaks { get; set; }
+
+    /// <summary>
+    /// Mod path for extract_iostore_legacy (utoc file or directory)
+    /// </summary>
+    [JsonPropertyName("mod_path")]
+    public string? ModPath { get; set; }
+
+    /// <summary>
+    /// Extract dependencies for extract_iostore_legacy
+    /// </summary>
+    [JsonPropertyName("with_deps")]
+    public bool WithDeps { get; set; } = false;
 }
 
 public class UAssetResponse
