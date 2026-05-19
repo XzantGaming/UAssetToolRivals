@@ -6061,11 +6061,11 @@ public partial class Program
         // Marvel Rivals AES key for obfuscation
         const string MARVEL_RIVALS_AES_KEY = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
 
-        // If obfuscate is enabled, use the game's AES key
-        if (obfuscate)
-        {
-            aesKey = MARVEL_RIVALS_AES_KEY;
-        }
+        // Separate keys: input PAK reading vs output IoStore encryption.
+        // The caller may provide aesKey purely to read an encrypted input PAK, even when
+        // they don't want the output IoStore to be encrypted.
+        string? inputPakAesKey = aesKey;  // Used only to read input PAK
+        string? outputEncryptionKey = obfuscate ? MARVEL_RIVALS_AES_KEY : null;  // Used to encrypt output
 
         string? effectiveInputDir = inputDir;
         string? tempExtractDir = null;
@@ -6084,8 +6084,9 @@ public partial class Program
 
             try
             {
-                // PakReader takes AES key as string (hex), not byte array
-                using var pakReader = new IoStore.PakReader(inputPak, aesKey);
+                // PakReader takes AES key as string (hex), not byte array.
+                // Use inputPakAesKey (separate from output encryption decision).
+                using var pakReader = new IoStore.PakReader(inputPak, inputPakAesKey);
                 int extracted = 0;
                 foreach (var file in pakReader.Files)
                 {
@@ -6202,15 +6203,17 @@ public partial class Program
             Console.Error.WriteLine($"[CreateModIoStore] Parallel conversion done. Writing IoStore...");
             Console.Error.Flush();
             
-            // Phase 2: Sequential write to IoStore
+            // Phase 2: Sequential write to IoStore.
+            // Only encrypt the output IoStore when obfuscation is explicitly requested.
+            // Do NOT encrypt just because aesKey was passed (it may be for reading input PAK only).
             using var ioStoreWriter = new IoStore.IoStoreWriter(
                 utocPath,
                 IoStore.EIoStoreTocVersion.PerfectHashWithOverflow,
                 IoStore.EIoContainerHeaderVersion.NoExportInfo,
                 mount,
                 compress,
-                !string.IsNullOrEmpty(aesKey),
-                aesKey);
+                obfuscate,
+                outputEncryptionKey);
             
             var filePaths = new List<string>();
             int converted = 0;
