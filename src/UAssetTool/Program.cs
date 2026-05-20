@@ -6100,7 +6100,14 @@ public partial class Program
                             continue;
 
                         byte[] data = pakReader.Get(file);
-                        string destPath = Path.Combine(tempExtractDir, file.Replace('/', Path.DirectorySeparatorChar));
+                        // CRITICAL: TrimStart('/') — PakReader keys begin with '/', and Path.Combine
+                        // treats a rooted second arg as absolute and DROPS tempExtractDir.
+                        // Without this trim, files write to the drive root (or fail), and the
+                        // later Directory.GetFiles in tempExtractDir finds nothing — leading to
+                        // a silent "Failed to create mod IoStore" further down. This matches
+                        // CliCreateModIoStore's behavior at line ~610.
+                        string relativePath = file.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
+                        string destPath = Path.Combine(tempExtractDir, relativePath);
                         Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
                         File.WriteAllBytes(destPath, data);
                         extracted++;
