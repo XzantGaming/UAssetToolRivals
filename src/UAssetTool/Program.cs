@@ -6392,7 +6392,23 @@ public partial class Program
             // Cleanup temp dir on any exception
             if (!string.IsNullOrEmpty(tempExtractDir) && Directory.Exists(tempExtractDir))
                 try { Directory.Delete(tempExtractDir, true); } catch { }
-            return new UAssetResponse { Success = false, Message = $"Failed to create mod IoStore: {ex.Message}" };
+
+            // Build a detailed error message including inner exceptions so callers can diagnose silent failures
+            var sb = new System.Text.StringBuilder();
+            sb.Append("Failed to create mod IoStore: ");
+            sb.Append(string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message);
+            var inner = ex.InnerException;
+            int depth = 0;
+            while (inner != null && depth < 5)
+            {
+                sb.Append(" | inner: ");
+                sb.Append(string.IsNullOrEmpty(inner.Message) ? inner.GetType().Name : inner.Message);
+                inner = inner.InnerException;
+                depth++;
+            }
+            // Also log full stack trace to stderr to aid debugging
+            Console.Error.WriteLine($"[CreateModIoStore] EXCEPTION: {ex}");
+            return new UAssetResponse { Success = false, Message = sb.ToString() };
         }
     }
     
