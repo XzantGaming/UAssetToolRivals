@@ -72,6 +72,7 @@ public partial class Program
                 "clone_mod_iostore" => CliCloneModIoStore(args),
                 "list_iostore" => CliListIoStore(args),
                 "extract_pak" => CliExtractPak(args),
+                "list_pak" => CliListPak(args),
                 "niagara_poc" => CliNiagaraPoc(args),
                 "niagara_details" => CliNiagaraDetails(args),
                 "niagara_edit" => CliNiagaraEdit(args),
@@ -153,6 +154,7 @@ public partial class Program
         Console.WriteLine("  Extraction:");
         Console.WriteLine("    extract_iostore_legacy <paks> <output> [options] - Extract IoStore to legacy format");
         Console.WriteLine("    extract_pak <pak_path> <output_dir> [options]    - Extract legacy PAK file");
+        Console.WriteLine("    list_pak <pak_path> [options]                    - List contents of a PAK file");
         Console.WriteLine("    extract_script_objects <paks> <output>           - Extract ScriptObjects.bin");
         Console.WriteLine();
         Console.WriteLine("  IoStore Utilities:");
@@ -2630,9 +2632,10 @@ public partial class Program
                 
                 // PAK operations
                 "list_pak_files" => ListPakFiles(request.FilePath, request.AesKey),
+                "list_pak" => ListPakJson(request.FilePath, request.AesKey, request.FilterPatterns),
                 "extract_pak_file" => ExtractPakFile(request.FilePath, request.InternalPath, request.OutputPath, request.AesKey),
                 "extract_pak_all" => ExtractPakAll(request.FilePath, request.OutputPath, request.AesKey),
-                "create_pak" => CreatePakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey),
+                "create_pak" => CreatePakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey, request.BasePath),
                 "create_companion_pak" => CreateCompanionPakJson(request.OutputPath, request.FilePaths, request.MountPoint, request.PathHashSeed, request.AesKey),
                 
                 // IoStore operations
@@ -5133,6 +5136,117 @@ public partial class Program
         }
     }
 
+    private static int CliListPak(string[] args)
+    {
+        if (args.Length < 2)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool list_pak <pak_path> [options]");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Lists files inside a PAK without extracting them.");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Options:");
+            Console.Error.WriteLine("  --aes <key>          AES decryption key (hex string, 64 chars)");
+            Console.Error.WriteLine("  --filter <patterns>  Only show files matching patterns (space-separated)");
+            Console.Error.WriteLine("  --paths-only         Print only the paths (no header, no sizes)");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Examples:");
+            Console.Error.WriteLine("  list_pak mod.pak");
+            Console.Error.WriteLine("  list_pak mod.pak --filter Marvel/Content/WwiseAudio");
+            Console.Error.WriteLine("  list_pak mod.pak --paths-only");
+            return 1;
+        }
+
+        string pakPath = args[1];
+        string? aesKey = null;
+        var filters = new List<string>();
+        bool pathsOnly = false;
+
+        for (int i = 2; i < args.Length; i++)
+        {
+            if (args[i] == "--aes" && i + 1 < args.Length)
+            {
+                aesKey = args[++i];
+            }
+            else if (args[i] == "--filter")
+            {
+                while (i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+                {
+                    filters.Add(args[++i]);
+                }
+            }
+            else if (args[i] == "--paths-only")
+            {
+                pathsOnly = true;
+            }
+        }
+
+        if (!File.Exists(pakPath))
+        {
+            Console.Error.WriteLine($"PAK file not found: {pakPath}");
+            return 1;
+        }
+
+        try
+        {
+            using var pakReader = new IoStore.PakReader(pakPath, aesKey);
+
+            var files = pakReader.Files.ToList();
+            if (filters.Count > 0)
+            {
+                files = files.Where(f =>
+                    filters.Any(filter => f.Contains(filter, StringComparison.OrdinalIgnoreCase))).ToList();
+            }
+            files.Sort(StringComparer.OrdinalIgnoreCase);
+
+            if (pathsOnly)
+            {
+                foreach (var f in files)
+                    Console.WriteLine(f);
+                return 0;
+            }
+
+            Console.WriteLine($"PAK: {pakPath}");
+            Console.WriteLine($"  Version:         {pakReader.Version}");
+            Console.WriteLine($"  Mount Point:     {pakReader.MountPoint}");
+            Console.WriteLine($"  Encrypted Index: {pakReader.EncryptedIndex}");
+            Console.WriteLine($"  Total Files:     {pakReader.Files.Count}");
+            if (filters.Count > 0)
+                Console.WriteLine($"  Filtered:        {files.Count} (matching [{string.Join(", ", filters)}])");
+            Console.WriteLine();
+
+            ulong totalUncompressed = 0;
+            ulong totalCompressed = 0;
+            foreach (var f in files)
+            {
+                var entry = pakReader.GetEntry(f);
+                if (entry != null)
+                {
+                    totalUncompressed += entry.UncompressedSize;
+                    totalCompressed += entry.CompressedSize;
+                    string flags = entry.IsEncrypted ? " [enc]" : "";
+                    string comp = entry.CompressionSlot.HasValue ? " [comp]" : "";
+                    Console.WriteLine($"  {f}");
+                    Console.WriteLine($"      {entry.UncompressedSize:N0} bytes (stored: {entry.CompressedSize:N0}){flags}{comp}");
+                }
+                else
+                {
+                    Console.WriteLine($"  {f}");
+                }
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"Total: {files.Count} files, {totalUncompressed:N0} bytes uncompressed, {totalCompressed:N0} bytes stored");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                Console.Error.WriteLine(ex.StackTrace);
+            return 1;
+        }
+    }
+
     private static int CliExtractPak(string[] args)
     {
         // Usage: extract_pak <pak_path> <output_dir> [--aes <key>] [--filter <patterns...>]
@@ -5426,47 +5540,147 @@ public partial class Program
     }
     
     /// <summary>
-    /// Create a PAK file from a list of files
+    /// Create a PAK file from a list of files and/or directories.
+    /// Each entry in <paramref name="filePaths"/> may be:
+    ///   - A directory: walked recursively, paths inside the PAK are relative to that directory.
+    ///   - A file: the in-PAK path is auto-detected via ResolveInPakPath
+    ///     (uses <paramref name="basePath"/> if provided, else looks for a "Marvel/Content/" anchor,
+    ///     else falls back to the bare filename).
     /// </summary>
-    private static UAssetResponse CreatePakJson(string? outputPath, List<string>? filePaths, string? mountPoint, ulong pathHashSeed, string? aesKey)
+    private static UAssetResponse CreatePakJson(string? outputPath, List<string>? filePaths, string? mountPoint, ulong pathHashSeed, string? aesKey, string? basePath = null)
     {
         if (string.IsNullOrEmpty(outputPath))
             return new UAssetResponse { Success = false, Message = "Output path is required" };
         if (filePaths == null || filePaths.Count == 0)
             return new UAssetResponse { Success = false, Message = "File paths are required" };
-        
+
         try
         {
             mountPoint ??= "../../../";
-            
-            using var pakWriter = new IoStore.PakWriter(mountPoint, pathHashSeed, aesKey);
-            
-            foreach (var filePath in filePaths)
+
+            // Resolve all inputs into (in-pak relative path, absolute path) pairs
+            var resolved = new List<(string relPath, string absPath)>();
+            string? explicitRoot = string.IsNullOrEmpty(basePath) ? null : Path.GetFullPath(basePath);
+
+            foreach (var input in filePaths)
             {
-                if (!File.Exists(filePath))
-                    return new UAssetResponse { Success = false, Message = $"File not found: {filePath}" };
-                
-                string relativePath = Path.GetFileName(filePath);
-                byte[] data = File.ReadAllBytes(filePath);
-                pakWriter.AddEntry(relativePath, data);
+                if (Directory.Exists(input))
+                {
+                    string baseDir = Path.GetFullPath(input);
+                    foreach (var f in Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories))
+                    {
+                        string absPath = Path.GetFullPath(f);
+                        string relPath = Path.GetRelativePath(baseDir, absPath).Replace('\\', '/');
+                        resolved.Add((relPath, absPath));
+                    }
+                }
+                else if (File.Exists(input))
+                {
+                    string absPath = Path.GetFullPath(input);
+                    string relPath = ResolveInPakPath(absPath, explicitRoot);
+                    resolved.Add((relPath, absPath));
+                }
+                else
+                {
+                    return new UAssetResponse { Success = false, Message = $"File or directory not found: {input}" };
+                }
             }
-            
+
+            if (resolved.Count == 0)
+                return new UAssetResponse { Success = false, Message = "No files were resolved from the provided paths" };
+
+            using var pakWriter = new IoStore.PakWriter(mountPoint, pathHashSeed, aesKey);
+            foreach (var (relPath, absPath) in resolved)
+            {
+                byte[] data = File.ReadAllBytes(absPath);
+                pakWriter.AddEntry(relPath, data);
+            }
             pakWriter.Write(outputPath);
-            
+
             return new UAssetResponse
             {
                 Success = true,
-                Message = $"Created PAK with {filePaths.Count} files",
+                Message = $"Created PAK with {resolved.Count} files",
                 Data = new Dictionary<string, object?>
                 {
                     ["output_path"] = outputPath,
-                    ["file_count"] = filePaths.Count
+                    ["file_count"] = resolved.Count,
+                    ["mount_point"] = mountPoint,
+                    ["entries"] = resolved.Select(r => r.relPath).ToList()
                 }
             };
         }
         catch (Exception ex)
         {
             return new UAssetResponse { Success = false, Message = $"Failed to create PAK: {ex.Message}" };
+        }
+    }
+
+    /// <summary>
+    /// JSON API equivalent of the list_pak CLI: returns a structured listing of a PAK
+    /// without extracting anything. Supports filter patterns.
+    /// </summary>
+    private static UAssetResponse ListPakJson(string? pakPath, string? aesKey, List<string>? filterPatterns)
+    {
+        if (string.IsNullOrEmpty(pakPath))
+            return new UAssetResponse { Success = false, Message = "PAK path is required" };
+        if (!File.Exists(pakPath))
+            return new UAssetResponse { Success = false, Message = $"PAK file not found: {pakPath}" };
+
+        try
+        {
+            using var pakReader = new IoStore.PakReader(pakPath, aesKey);
+
+            var paths = pakReader.Files.ToList();
+            if (filterPatterns != null && filterPatterns.Count > 0)
+            {
+                paths = paths.Where(f =>
+                    filterPatterns.Any(p => f.Contains(p, StringComparison.OrdinalIgnoreCase))).ToList();
+            }
+            paths.Sort(StringComparer.OrdinalIgnoreCase);
+
+            var entries = new List<Dictionary<string, object?>>(paths.Count);
+            ulong totalUncompressed = 0;
+            ulong totalCompressed = 0;
+            foreach (var p in paths)
+            {
+                var e = pakReader.GetEntry(p);
+                if (e != null)
+                {
+                    totalUncompressed += e.UncompressedSize;
+                    totalCompressed += e.CompressedSize;
+                }
+                entries.Add(new Dictionary<string, object?>
+                {
+                    ["path"] = p,
+                    ["size"] = e?.UncompressedSize ?? 0,
+                    ["compressed_size"] = e?.CompressedSize ?? 0,
+                    ["encrypted"] = e?.IsEncrypted ?? false,
+                    ["compressed"] = e?.CompressionSlot.HasValue ?? false
+                });
+            }
+
+            return new UAssetResponse
+            {
+                Success = true,
+                Message = $"Found {entries.Count} files in PAK",
+                Data = new Dictionary<string, object?>
+                {
+                    ["pak_path"] = pakPath,
+                    ["version"] = pakReader.Version,
+                    ["mount_point"] = pakReader.MountPoint,
+                    ["encrypted_index"] = pakReader.EncryptedIndex,
+                    ["total_files"] = pakReader.Files.Count,
+                    ["filtered_count"] = entries.Count,
+                    ["total_uncompressed_bytes"] = totalUncompressed,
+                    ["total_compressed_bytes"] = totalCompressed,
+                    ["files"] = entries
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            return new UAssetResponse { Success = false, Message = $"Failed to list PAK: {ex.Message}" };
         }
     }
     
