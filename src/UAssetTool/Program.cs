@@ -258,19 +258,34 @@ public partial class Program
     {
         if (args.Length < 3)
         {
-            Console.Error.WriteLine("Usage: UAssetTool create_pak <output.pak> <file1> [file2] ...");
-            Console.Error.WriteLine("  Creates an encrypted PAK file with the specified files.");
-            Console.Error.WriteLine("  Files are added with their relative paths.");
+            Console.Error.WriteLine("Usage: UAssetTool create_pak <output.pak> <input1> [input2] ...");
+            Console.Error.WriteLine("  Creates an encrypted PAK file. Inputs may be files or directories.");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Path handling:");
+            Console.Error.WriteLine("  - Directory input: all files are added recursively with paths relative");
+            Console.Error.WriteLine("    to that directory (preserves Marvel/Content/... structure when present).");
+            Console.Error.WriteLine("  - File input: the path inside the PAK is auto-detected by looking for");
+            Console.Error.WriteLine("    a 'Marvel/Content/' ancestor in the absolute path. If found, the");
+            Console.Error.WriteLine("    in-PAK path starts at 'Marvel/Content/...'. Otherwise the bare filename");
+            Console.Error.WriteLine("    is used. Use --root to override the base directory explicitly.");
             Console.Error.WriteLine();
             Console.Error.WriteLine("Options:");
+            Console.Error.WriteLine("  --root <dir>          - Base directory; subsequent files are stored");
+            Console.Error.WriteLine("                          with paths relative to this directory.");
             Console.Error.WriteLine("  --mount-point <path>  - Mount point (default: ../../../)");
             Console.Error.WriteLine("  --aes-key <hex>       - AES key in hex format");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("Examples:");
+            Console.Error.WriteLine("  create_pak mod.pak \"B:\\Mods\\MyMod_P\"");
+            Console.Error.WriteLine("  create_pak mod.pak \"B:\\Mods\\MyMod_P\\Marvel\\Content\\WwiseAudio\\foo.bnk\"");
+            Console.Error.WriteLine("  create_pak mod.pak --root \"B:\\Mods\\MyMod_P\" file1 file2");
             return 1;
         }
 
         string outputPath = args[1];
         string mountPoint = "../../../";
         string? aesKey = null;
+        string? explicitRoot = null;
         var files = new List<(string relativePath, string absolutePath)>();
 
         for (int i = 2; i < args.Length; i++)
@@ -283,15 +298,37 @@ public partial class Program
             {
                 aesKey = args[++i];
             }
+            else if (args[i] == "--root" && i + 1 < args.Length)
+            {
+                explicitRoot = Path.GetFullPath(args[++i]);
+                if (!Directory.Exists(explicitRoot))
+                {
+                    Console.Error.WriteLine($"Warning: --root directory not found: {explicitRoot}");
+                }
+            }
+            else if (Directory.Exists(args[i]))
+            {
+                // Directory input: walk recursively, use paths relative to this directory
+                string baseDir = Path.GetFullPath(args[i]);
+                int added = 0;
+                foreach (var f in Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories))
+                {
+                    string absPath = Path.GetFullPath(f);
+                    string relPath = Path.GetRelativePath(baseDir, absPath).Replace('\\', '/');
+                    files.Add((relPath, absPath));
+                    added++;
+                }
+                Console.Error.WriteLine($"[CreatePak] Added directory '{baseDir}' ({added} files)");
+            }
             else if (File.Exists(args[i]))
             {
                 string absPath = Path.GetFullPath(args[i]);
-                string relPath = Path.GetFileName(args[i]);
+                string relPath = ResolveInPakPath(absPath, explicitRoot);
                 files.Add((relPath, absPath));
             }
             else
             {
-                Console.Error.WriteLine($"Warning: File not found: {args[i]}");
+                Console.Error.WriteLine($"Warning: File or directory not found: {args[i]}");
             }
         }
 
@@ -313,7 +350,7 @@ public partial class Program
             }
 
             pakWriter.Write(outputPath);
-            Console.WriteLine($"SUCCESS: Created PAK file at {outputPath}");
+            Console.WriteLine($"SUCCESS: Created PAK file at {outputPath} ({files.Count} entries)");
             return 0;
         }
         catch (Exception ex)
@@ -321,6 +358,39 @@ public partial class Program
             Console.Error.WriteLine($"ERROR: {ex.Message}");
             return 1;
         }
+    }
+
+    /// <summary>
+    /// Resolve the in-PAK path for a single file input.
+    /// Priority:
+    ///   1. If --root was provided and the file is under it, use the relative path.
+    ///   2. Otherwise, look for a "Marvel/Content/" segment in the absolute path and
+    ///      use everything from "Marvel/" onward (matches game's mount-relative layout).
+    ///   3. Fall back to the bare filename.
+    /// </summary>
+    private static string ResolveInPakPath(string absPath, string? explicitRoot)
+    {
+        string normalized = absPath.Replace('\\', '/');
+
+        if (!string.IsNullOrEmpty(explicitRoot))
+        {
+            string rootNorm = explicitRoot.Replace('\\', '/').TrimEnd('/');
+            if (normalized.StartsWith(rootNorm + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                return normalized.Substring(rootNorm.Length + 1);
+            }
+        }
+
+        // Auto-detect Marvel/Content/ as the mod root anchor (case-insensitive)
+        const string anchor = "/Marvel/Content/";
+        int idx = normalized.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
+        if (idx >= 0)
+        {
+            // Return path starting from "Marvel/Content/..."
+            return normalized.Substring(idx + 1);
+        }
+
+        return Path.GetFileName(absPath);
     }
 
     private static int CliCreateCompanionPak(string[] args)
