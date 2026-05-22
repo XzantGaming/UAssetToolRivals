@@ -76,16 +76,21 @@ public class PakWriter : IDisposable
         // Pad data to 16-byte alignment for encryption
         byte[] paddedData = PadToAlignment(data, 16);
 
-        // Normalize path to match how it will be stored in the index
-        // TrySplitPathChild adds "/" prefix for paths without directory
-        string normalizedPath = path;
-        if (!path.StartsWith("/"))
+        // Normalize path: convert backslashes to forward slashes, ensure leading "/"
+        // This matches how PakReader reconstructs paths from the FDI (directory + filename),
+        // which always produces a "/"-prefixed path.
+        string normalizedPath = path.Replace('\\', '/');
+        if (!normalizedPath.StartsWith("/"))
         {
-            normalizedPath = "/" + path;
+            normalizedPath = "/" + normalizedPath;
         }
 
-        // Calculate encryption limit based on path hash (repak's get_limit function from data.rs)
-        int limit = GetEncryptionLimit(normalizedPath);
+        // Calculate encryption limit using the SAME root_path logic as the reader.
+        // The reader does: ComputeRootPath(MountPoint, entryPath), which yields a path
+        // relative to the mount root (e.g. "Marvel/Content/Foo.uasset"). Writer MUST
+        // hash the same string so partial decryption uses matching byte limits.
+        string rootPath = ComputeRootPath(_mountPoint, normalizedPath);
+        int limit = GetEncryptionLimit(rootPath);
         if (limit > paddedData.Length)
         {
             limit = paddedData.Length;
@@ -111,7 +116,7 @@ public class PakWriter : IDisposable
 
         var entry = new PakEntry
         {
-            Path = path,
+            Path = normalizedPath,
             Offset = (ulong)entryOffset,
             UncompressedSize = (ulong)data.Length,
             CompressedSize = (ulong)partiallyEncrypted.Length,
@@ -145,6 +150,39 @@ public class PakWriter : IDisposable
         entry.Offset = (ulong)entryOffset;
 
         _entries.Add(entry);
+    }
+
+    /// <summary>
+    /// Compute the root path for encryption limit calculation.
+    /// MUST match PakReader.ComputeRootPath exactly: concat mount_point + "/" + entryPath,
+    /// deduplicate consecutive slashes, then strip "../../../" prefix.
+    /// </summary>
+    private static string ComputeRootPath(string mountPoint, string entryPath)
+    {
+        string combined = mountPoint + "/" + entryPath;
+        // Deduplicate consecutive slashes
+        var sb = new StringBuilder(combined.Length);
+        bool lastWasSlash = false;
+        foreach (char c in combined)
+        {
+            if (c == '/')
+            {
+                if (!lastWasSlash)
+                    sb.Append(c);
+                lastWasSlash = true;
+            }
+            else
+            {
+                sb.Append(c);
+                lastWasSlash = false;
+            }
+        }
+        string result = sb.ToString();
+        // Strip "../../../" prefix
+        const string prefix = "../../../";
+        if (result.StartsWith(prefix))
+            result = result.Substring(prefix.Length);
+        return result;
     }
 
     /// <summary>
