@@ -76,19 +76,23 @@ public class PakWriter : IDisposable
         // Pad data to 16-byte alignment for encryption
         byte[] paddedData = PadToAlignment(data, 16);
 
-        // Normalize path: convert backslashes to forward slashes, ensure leading "/"
-        // This matches how PakReader reconstructs paths from the FDI (directory + filename),
-        // which always produces a "/"-prefixed path.
-        string normalizedPath = path.Replace('\\', '/');
-        if (!normalizedPath.StartsWith("/"))
+        // Normalize path: convert backslashes to forward slashes, strip any leading "/".
+        // Real game PAKs (and repak-trumank output) store paths WITHOUT a leading slash
+        // (e.g. "Marvel/Content/Foo.uasset"). The FDI directory for a root-level file is "/"
+        // and the filename is "foo.bnk"; for a deep path the directory is "Marvel/Content/"
+        // (no leading slash). The leading slash had previously been added here but caused
+        // the game's mount-relative lookups (and FModel) to fail, since they expect paths
+        // without a leading slash.
+        string normalizedPath = path.Replace('\\', '/').TrimStart('/');
+        if (normalizedPath.Length == 0)
         {
-            normalizedPath = "/" + normalizedPath;
+            throw new ArgumentException("Entry path must not be empty after normalization", nameof(path));
         }
 
         // Calculate encryption limit using the SAME root_path logic as the reader.
-        // The reader does: ComputeRootPath(MountPoint, entryPath), which yields a path
-        // relative to the mount root (e.g. "Marvel/Content/Foo.uasset"). Writer MUST
-        // hash the same string so partial decryption uses matching byte limits.
+        // The reader does: ComputeRootPath(MountPoint, entryPath). ComputeRootPath
+        // concatenates with "/" and deduplicates slashes, so the leading-slash difference
+        // doesn't affect the hashed string. Both sides hash e.g. "Marvel/Content/Foo.uasset".
         string rootPath = ComputeRootPath(_mountPoint, normalizedPath);
         int limit = GetEncryptionLimit(rootPath);
         if (limit > paddedData.Length)
