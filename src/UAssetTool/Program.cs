@@ -5564,6 +5564,37 @@ public partial class Program
 
             foreach (var input in filePaths)
             {
+                // Support explicit "relPath=absPath" mapping (used by the Rust binding to
+                // preserve the exact in-PAK path the caller already computed). Split on the
+                // first '=' so absolute paths that happen to contain '=' on the rhs still work.
+                // Only treat as a mapping when the rhs resolves to an existing file/directory,
+                // so raw paths that legitimately contain '=' keep working too.
+                int eqIdx = input.IndexOf('=');
+                if (eqIdx > 0)
+                {
+                    string maybeRel = input.Substring(0, eqIdx);
+                    string maybeAbs = input.Substring(eqIdx + 1);
+                    if (File.Exists(maybeAbs))
+                    {
+                        string absPath = Path.GetFullPath(maybeAbs);
+                        string relPath = maybeRel.Replace('\\', '/');
+                        resolved.Add((relPath, absPath));
+                        continue;
+                    }
+                    if (Directory.Exists(maybeAbs))
+                    {
+                        string baseDir = Path.GetFullPath(maybeAbs);
+                        string relRoot = maybeRel.Replace('\\', '/').TrimEnd('/');
+                        foreach (var f in Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories))
+                        {
+                            string absPath = Path.GetFullPath(f);
+                            string sub = Path.GetRelativePath(baseDir, absPath).Replace('\\', '/');
+                            string relPath = string.IsNullOrEmpty(relRoot) ? sub : $"{relRoot}/{sub}";
+                            resolved.Add((relPath, absPath));
+                        }
+                        continue;
+                    }
+                }
                 if (Directory.Exists(input))
                 {
                     string baseDir = Path.GetFullPath(input);
