@@ -239,6 +239,37 @@ public class ZenConverter
             }
         }
 
+        // DefaultHiddenMaterials: read per-LOD bool[] from the AssetUserData carrier
+        // and inject as a TArray<bool> property into each FSkeletalMeshLODInfo struct.
+        // This is the proprietary Marvel Rivals field at offset 0x0018 inside FSkeletalMeshLODInfo;
+        // missing it causes deserialization access violations on SkeletalMesh load.
+        // Reuses the same plugin/import-remap pattern as MaterialTags.
+        if (_enableMaterialTags && skeletalExport != null)
+        {
+            try
+            {
+                var hiddenResult = HiddenMaterialsReader.ReadFromAsset(asset);
+                if (hiddenResult.FoundUserData)
+                {
+                    int injected = HiddenMaterialsReader.InjectIntoLodInfo(
+                        skeletalExport, hiddenResult, asset);
+
+                    string meshName = System.IO.Path.GetFileNameWithoutExtension(asset.FilePath ?? "");
+                    Console.Error.WriteLine($"[HiddenMaterials] {meshName}: Found UserData with {hiddenResult.PerLodFlags.Count} LOD list(s), injected DefaultHiddenMaterials into {injected} LOD struct(s)");
+
+                    if (Environment.GetEnvironmentVariable("DEBUG") == "1")
+                    {
+                        foreach (var diag in hiddenResult.Diagnostics)
+                            Console.Error.WriteLine($"[HiddenMaterials]   {diag}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[HiddenMaterials] WARNING: Failed to inject DefaultHiddenMaterials: {ex.Message}");
+            }
+        }
+
         // Check if this is a StaticMesh or StringTable
         bool isStaticMesh = asset.Exports.Any(e => 
             e.GetExportClassType()?.Value?.Value == "StaticMesh");
