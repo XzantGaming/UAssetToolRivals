@@ -816,12 +816,12 @@ public class ZenConverter
             // /Script/Engine equivalents. The game doesn't know about MaterialTagPlugin —
             // we can't strip the export (Extras raw binary has FPackageIndex we can't remap)
             // so instead we remap the class to the engine-native base class AssetUserData.
-            if (_enableMaterialTags && objectPath.Contains("/MaterialTagPlugin"))
+            if (_enableMaterialTags && (objectPath.Contains("/MaterialTagPlugin") || objectPath.Contains("/RivalsMeshMaterialManager")))
             {
                 string replacedPath;
                 if (objectPath.Contains("Default__"))
                     replacedPath = "/Script/Engine.Default__AssetUserData";
-                else if (objectPath.Contains("MaterialTagAssetUserData"))
+                else if (objectPath.Contains("MaterialTagAssetUserData") || objectPath.Contains("HiddenMaterialsAssetUserData"))
                     replacedPath = "/Script/Engine.AssetUserData";
                 else
                     replacedPath = "/Script/Engine"; // package itself

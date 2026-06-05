@@ -22,9 +22,9 @@ namespace UAssetTool.ZenPackage;
 ///
 /// Carrier format on the AssetUserData export (matching the editor plugin):
 /// <code>
-/// LODHiddenMaterials : TArray&lt;FRivalsLODHiddenMaterials&gt;
-///   [i] FRivalsLODHiddenMaterials
-///        HiddenMaterials : TArray&lt;bool&gt;
+/// LODHiddenMaterials : TArray&lt;FLODHiddenMaterials&gt;
+///   [i] FLODHiddenMaterials
+///        HiddenMaterials : TArray&lt;uint8&gt;
 /// </code>
 ///
 /// The carrier is left in the package; its imports are remapped to
@@ -68,6 +68,7 @@ public static class HiddenMaterialsReader
 
             bool looksLikeCarrier =
                 className.Contains("MaterialTagAssetUserData", StringComparison.OrdinalIgnoreCase) ||
+                className.Contains("HiddenMaterialsAssetUserData", StringComparison.OrdinalIgnoreCase) ||
                 className.Contains("RivalsMeshData", StringComparison.OrdinalIgnoreCase) ||
                 className.Contains("RivalsLODHiddenMaterialsData", StringComparison.OrdinalIgnoreCase);
 
@@ -274,6 +275,8 @@ public static class HiddenMaterialsReader
                 {
                     if (arr.Value[i] is BoolPropertyData bp)
                         output[i] = bp.Value;
+                    else if (arr.Value[i] is BytePropertyData bpd)
+                        output[i] = bpd.Value != 0;
                 }
                 return output;
             }
