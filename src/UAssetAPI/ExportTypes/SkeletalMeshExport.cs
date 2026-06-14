@@ -175,7 +175,7 @@ namespace UAssetAPI.ExportTypes
                 // 3. Read FSkeletalMaterial array
                 _materialsOffset = (int)extraReader.BaseStream.Position;
                 int materialCount = extraReader.ReadInt32();
-                
+
                 if (materialCount > 0 && materialCount <= 100)
                 {
                     // Try to detect if materials have FGameplayTagContainer by checking structure
@@ -543,30 +543,49 @@ namespace UAssetAPI.ExportTypes
             
             try
             {
-                // Special case: single material
-                // Check what comes AFTER the material - should be FReferenceSkeleton starting with bone count
-                // If we see count=0 at +40 and bone count at +44, GameplayTagContainer is present
+                // Special case: single material.
+                // The multi-material path detects tags by checking whether the NEXT material's
+                // FPackageIndex follows — but with one material there is no next material; what
+                // follows is the FReferenceSkeleton (no tags), or an FGameplayTagContainer then the
+                // FReferenceSkeleton (tags). We disambiguate by validating the skeleton under each
+                // hypothesis, exploiting the invariant that FReferenceSkeleton's RefBonePose count
+                // always equals its RefBoneInfo count. This reliably handles meshes with NO
+                // container, an EMPTY container, and a NON-EMPTY container alike (the old
+                // "+40 == 0" heuristic only recognized empty containers and left the stream
+                // mispositioned, corrupting single-material meshes).
                 if (materialCount == 1)
                 {
-                    // Need 48 bytes to check: 40 for material + 4 for potential tag count + 4 for next value
-                    if (startPos + 48 > extrasLength)
+                    const int MAT_SIZE = 40; // FPackageIndex(4)+FName(8)+FName(8)+FMeshUVChannelInfo(20)
+
+                    // Hypothesis A: no FGameplayTagContainer — skeleton sits right after the material.
+                    if (IsValidRefSkeletonStart(startPos + MAT_SIZE, extrasLength))
                     {
+                        reader.BaseStream.Position = startPos;
                         return false;
                     }
-                    
-                    // Read at offset +40 from material start (after one 40-byte material)
-                    reader.BaseStream.Position = startPos + 40;
-                    int tagCountOrBoneCount = reader.ReadInt32();
-                    int nextValue = reader.ReadInt32();
-                    
-                    // If +40 is 0 and +44 looks like a bone count (positive, reasonable), we have tags
-                    // Bone counts are typically 1-300 for Marvel Rivals characters
-                    if (tagCountOrBoneCount == 0 && nextValue > 0 && nextValue < 1000)
+
+                    // Hypothesis B: FGameplayTagContainer present — read its tag count, skip the tags
+                    // (8 bytes each), then expect a valid skeleton. Covers empty (count 0) too.
+                    long tagCountPos = startPos + MAT_SIZE;
+                    if (tagCountPos + 4 <= extrasLength)
                     {
-                        return true;
+                        reader.BaseStream.Position = tagCountPos;
+                        int tagCount = reader.ReadInt32();
+                        if (tagCount >= 0 && tagCount <= 1024)
+                        {
+                            long skelPos = tagCountPos + 4 + (long)tagCount * FGameplayTag.SerializedSize;
+                            if (IsValidRefSkeletonStart(skelPos, extrasLength))
+                            {
+                                reader.BaseStream.Position = startPos;
+                                return true;
+                            }
+                        }
                     }
-                    // If +40 is a positive number (bone count), no tags present
-                    // If +40 is negative (would be unexpected), no tags
+
+                    // Neither layout validated (truncated/unexpected data): assume no tags (safe
+                    // default — the converter will inject empty padding) and leave the reader at
+                    // the material start so the caller reads from the correct offset.
+                    reader.BaseStream.Position = startPos;
                     return false;
                 }
                 
@@ -645,6 +664,28 @@ namespace UAssetAPI.ExportTypes
                 reader.BaseStream.Position = startPos;
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Heuristically validate that <paramref name="pos"/> is the start of an FReferenceSkeleton
+        /// inside the Extras buffer. Exploits the invariant that RefBonePose count == RefBoneInfo
+        /// count: reads the bone-info count, skips the bone-info array (12 bytes each:
+        /// FName(8) + int32 ParentIndex(4)), and checks that the following int32 (RefBonePose count)
+        /// matches. Used to disambiguate single-material tag layouts.
+        /// </summary>
+        private bool IsValidRefSkeletonStart(long pos, long extrasLength)
+        {
+            const int BONE_INFO_SIZE = 12; // FName(8) + int32 ParentIndex(4)
+            if (Extras == null || pos < 0 || pos + 4 > extrasLength) return false;
+
+            int boneCount = BitConverter.ToInt32(Extras, (int)pos);
+            if (boneCount <= 0 || boneCount > 8192) return false;
+
+            long poseCountPos = pos + 4 + (long)boneCount * BONE_INFO_SIZE;
+            if (poseCountPos + 4 > extrasLength) return false;
+
+            int poseCount = BitConverter.ToInt32(Extras, (int)poseCountPos);
+            return poseCount == boneCount;
         }
 
         /// <summary>

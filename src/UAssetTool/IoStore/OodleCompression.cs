@@ -52,9 +52,10 @@ public static class OodleCompression
     private const string OODLE_DOWNLOAD_URL = "https://github.com/new-world-tools/go-oodle/releases/download/v0.2.3-files/oo2core_9_win64.dll";
     private const long OODLE_MIN_VALID_SIZE = 500_000; // 500KB minimum
 
-    private static bool _initialized = false;
-    private static bool _available = false;
+    private static volatile bool _initialized = false;
+    private static volatile bool _available = false;
     private static bool _resolverRegistered = false;
+    private static readonly object _initLock = new object();
 
     /// <summary>
     /// Get the platform-specific Oodle library filename.
@@ -152,54 +153,71 @@ public static class OodleCompression
         if (_initialized)
             return;
 
-        _initialized = true;
-        RegisterResolver();
-
-        try
+        // Serialize initialization. Without this lock, parallel callers (e.g. Parallel.ForEach
+        // extraction with many threads) race: the old code set _initialized=true BEFORE the
+        // library finished loading, so concurrent IsAvailable checks saw "initialized but not
+        // available" and their Decompress calls silently returned null — making extraction flaky
+        // (only the racing thread's chunks decompressed, a different subset each run). We publish
+        // _initialized LAST (in finally) so other threads either wait here or read the final state.
+        lock (_initLock)
         {
-            string exePath = AppContext.BaseDirectory;
-            string libName = GetPlatformLibraryName();
-            string libPath = Path.Combine(exePath, libName);
+            if (_initialized)
+                return;
 
-            // Check if library exists and is valid
-            if (!IsOodleValid(libPath))
+            try
             {
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                RegisterResolver();
+
+                string exePath = AppContext.BaseDirectory;
+                string libName = GetPlatformLibraryName();
+                string libPath = Path.Combine(exePath, libName);
+
+                // Check if library exists and is valid
+                if (!IsOodleValid(libPath))
                 {
-                    // Auto-download only on Windows
-                    Console.Error.WriteLine($"[Oodle] Downloading Oodle library...");
-                    DownloadOodle(libPath);
+                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    {
+                        // Auto-download only on Windows
+                        Console.Error.WriteLine($"[Oodle] Downloading Oodle library...");
+                        DownloadOodle(libPath);
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine($"[Oodle] Oodle library not found: {libName}");
+                        Console.Error.WriteLine($"[Oodle] Place the Oodle library beside the executable to enable Oodle compression.");
+                        return;
+                    }
                 }
-                else
+
+                // Try to load and test
+                if (File.Exists(libPath))
                 {
-                    Console.Error.WriteLine($"[Oodle] Oodle library not found: {libName}");
-                    Console.Error.WriteLine($"[Oodle] Place the Oodle library beside the executable to enable Oodle compression.");
-                    return;
+                    // Test by calling GetCompressedBufferSizeNeeded
+                    var size = OodleLZ_GetCompressedBufferSizeNeeded(OodleCompressor.Kraken, (IntPtr)1024);
+                    if (size.ToInt64() > 0)
+                    {
+                        _available = true;
+                        Console.Error.WriteLine($"[Oodle] Initialized successfully");
+                    }
                 }
             }
-
-            // Try to load and test
-            if (File.Exists(libPath))
+            catch (DllNotFoundException)
             {
-                // Test by calling GetCompressedBufferSizeNeeded
-                var size = OodleLZ_GetCompressedBufferSizeNeeded(OodleCompressor.Kraken, (IntPtr)1024);
-                if (size.ToInt64() > 0)
-                {
-                    _available = true;
-                    Console.Error.WriteLine($"[Oodle] Initialized successfully");
-                }
+                Console.Error.WriteLine($"[Oodle] Native library not found for this platform ({RuntimeInformation.OSDescription}).");
+                Console.Error.WriteLine($"[Oodle] Expected: {GetPlatformLibraryName()}");
+                _available = false;
             }
-        }
-        catch (DllNotFoundException)
-        {
-            Console.Error.WriteLine($"[Oodle] Native library not found for this platform ({RuntimeInformation.OSDescription}).");
-            Console.Error.WriteLine($"[Oodle] Expected: {GetPlatformLibraryName()}");
-            _available = false;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[Oodle] Failed to initialize: {ex.Message}");
-            _available = false;
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Oodle] Failed to initialize: {ex.Message}");
+                _available = false;
+            }
+            finally
+            {
+                // Publish completion LAST, even on early return/exception, so we never re-init
+                // and concurrent callers observe a consistent final state.
+                _initialized = true;
+            }
         }
     }
 
