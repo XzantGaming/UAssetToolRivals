@@ -71,6 +71,9 @@ public partial class Program
                 "dump_zen_from_game" => CliDumpZenFromGame(args),
                 "clone_mod_iostore" => CliCloneModIoStore(args),
                 "list_iostore" => CliListIoStore(args),
+                "probe_chunks" => CliProbeChunks(args),
+                "roundtrip" => CliRoundtrip(args),
+                "test_objinject" => CliTestObjInject(args),
                 "extract_pak" => CliExtractPak(args),
                 "list_pak" => CliListPak(args),
                 "niagara_poc" => CliNiagaraPoc(args),
@@ -79,6 +82,7 @@ public partial class Program
                 "niagara_audit" => CliNiagaraAudit(args),
                 "skeletal_mesh_info" => CliSkeletalMeshInfo(args),
                 "inject_texture" => CliInjectTexture(args),
+                "inject_texture_obj" => CliInjectTextureObj(args),
                 "extract_texture" => CliExtractTexture(args),
                 "batch_inject_texture" => CliBatchInjectTexture(args),
                 "batch_extract_texture" => CliBatchExtractTexture(args),
@@ -383,12 +387,15 @@ public partial class Program
             }
         }
 
-        // Auto-detect Marvel/Content/ as the mod root anchor (case-insensitive)
-        const string anchor = "/Marvel/Content/";
+        // Auto-detect the "Marvel/" mount root anchor (case-insensitive). Anchoring on "/Marvel/"
+        // (not "/Marvel/Content/") preserves the full mount-relative layout for non-Content folders
+        // too — e.g. Marvel/Config/DefaultEngine.ini, Marvel/Plugins/... — while giving identical
+        // results for Content assets. "/MarvelGame/" and "/MarvelRivals/" do NOT contain "/Marvel/".
+        const string anchor = "/Marvel/";
         int idx = normalized.IndexOf(anchor, StringComparison.OrdinalIgnoreCase);
         if (idx >= 0)
         {
-            // Return path starting from "Marvel/Content/..."
+            // Return path starting from "Marvel/..."
             return normalized.Substring(idx + 1);
         }
 
@@ -4802,6 +4809,201 @@ public partial class Program
     /// <summary>
     /// List IoStore contents showing which packages have accompanying BulkData (.ubulk).
     /// </summary>
+    /// <summary>
+    /// Diagnostic: locate a package by name substring, then report EVERY chunk that shares its
+    /// package id across all containers in a Paks dir — including bare BulkData/OptionalBulkData
+    /// (.ubulk/.uptnl) chunks that have no export bundle and are invisible to list_iostore.
+    /// Usage: probe_chunks &lt;paks_dir&gt; &lt;name_substr&gt; [--aes &lt;key&gt;]
+    /// </summary>
+    /// <summary>
+    /// Diagnostic: load an asset via the object model and write it back UNMODIFIED to a new path,
+    /// so the input/output .uasset/.uexp can be byte-compared (object-model round-trip fidelity test).
+    /// Usage: roundtrip &lt;input.uasset&gt; &lt;output.uasset&gt; [--usmap &lt;path&gt;]
+    /// </summary>
+    private static int CliRoundtrip(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool roundtrip <input.uasset> <output.uasset> [--usmap <path>]");
+            return 1;
+        }
+        string input = args[1], output = args[2];
+        string? usmap = null;
+        for (int i = 3; i < args.Length; i++)
+            if (args[i] == "--usmap" && i + 1 < args.Length) usmap = args[++i];
+
+        var asset = LoadAsset(input, usmap);
+        asset.UseSeparateBulkDataFiles = true;
+        asset.Write(output);
+        Console.WriteLine($"Round-tripped {input} -> {output}");
+        return 0;
+    }
+
+    /// <summary>Find the first offset of needle within haystack (naive; needle is large/unique here).</summary>
+    private static int IndexOfBytes(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0 || needle.Length > haystack.Length) return -1;
+        int last = haystack.Length - needle.Length;
+        for (int i = 0; i <= last; i++)
+        {
+            int j = 0;
+            while (j < needle.Length && haystack[i + j] == needle[j]) j++;
+            if (j == needle.Length) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Read one DataResource's bytes from the right source file (by LegacyBulkDataFlags).</summary>
+    private static byte[] ReadResourceBytes(FObjectDataResource dr, string uexp, string ubulk, string uptnl)
+    {
+        const uint INLINE = 0x40, INSEP = 0x100, OPT = 0x800;
+        int size = (int)dr.RawSize; long off = dr.SerialOffset;
+        if (size <= 0) return Array.Empty<byte>();
+        string? file = (dr.LegacyBulkDataFlags & INLINE) != 0 ? uexp
+                     : (dr.LegacyBulkDataFlags & OPT) != 0 ? uptnl
+                     : (dr.LegacyBulkDataFlags & INSEP) != 0 ? ubulk : uexp;
+        if (file == null || !File.Exists(file)) return Array.Empty<byte>();
+        var bytes = File.ReadAllBytes(file);
+        if (off < 0 || off + size > bytes.Length) return Array.Empty<byte>();
+        var d = new byte[size]; Array.Copy(bytes, off, d, 0, size); return d;
+    }
+
+    /// <summary>
+    /// Experiment: rebuild a texture as ALL-INLINE (every mip's pixels populated + DataResources
+    /// rebuilt to inline) via the object model, write it, then re-parse to test structural validity.
+    /// Usage: test_objinject &lt;in.uasset&gt; &lt;out.uasset&gt; [--usmap &lt;m&gt;]
+    /// </summary>
+    private static int CliTestObjInject(string[] args)
+    {
+        string input = args[1], output = args[2]; string? usmap = null;
+        for (int i = 3; i < args.Length; i++) if (args[i] == "--usmap" && i + 1 < args.Length) usmap = args[++i];
+
+        var asset = LoadAsset(input, usmap);
+        asset.UseSeparateBulkDataFiles = true;
+        var tex = asset.Exports.OfType<TextureExport>().FirstOrDefault();
+        if (tex?.PlatformData == null) { Console.Error.WriteLine("no platform data"); return 1; }
+        var pd = tex.PlatformData;
+        var origDR = asset.DataResources!;
+        Console.WriteLine($"Original: {pd.SizeX}x{pd.SizeY} {pd.PixelFormat}, {pd.Mips.Count} mips, DataResources={origDR.Count}");
+
+        string uexp = Path.ChangeExtension(input, ".uexp"), ubulk = Path.ChangeExtension(input, ".ubulk"), uptnl = Path.ChangeExtension(input, ".uptnl");
+        var outer = origDR[0].OuterIndex;
+        var newMips = new List<FTexture2DMipMap>();
+        var newDR = new List<FObjectDataResource>();
+        for (int i = 0; i < pd.Mips.Count && i < origDR.Count; i++)
+        {
+            byte[] data = ReadResourceBytes(origDR[i], uexp, ubulk, uptnl);
+            int w = Math.Max(1, pd.SizeX >> i), h = Math.Max(1, pd.SizeY >> i);
+            Console.WriteLine($"  mip{i}: {w}x{h} -> read {data.Length} bytes");
+            var bd = new FByteBulkData(data);
+            bd.Header.DataResourceIndex = i;
+            bd.Header.BulkDataFlags = EBulkDataFlags.BULKDATA_ForceInlinePayload;
+            newMips.Add(new FTexture2DMipMap(bd, w, h, 1));
+            newDR.Add(new FObjectDataResource(EObjectDataResourceFlags.Inline, 0, -1, data.Length, data.Length, outer, (uint)EBulkDataFlags.BULKDATA_ForceInlinePayload, 0));
+        }
+        pd.Mips = newMips; pd.FirstMipToSerialize = 0;
+        asset.DataResources = newDR;
+        asset.Write(output);
+
+        // Pass 2: the inline pixel data is written sequentially after the mip headers; locate mip0's
+        // data in the written .uexp and set each DataResource's SerialOffset to its true position
+        // (the game reads inline sequentially and ignores these, but our offset-based extractor needs them).
+        string outUexpPath = Path.ChangeExtension(output, ".uexp");
+        byte[] outBytes = File.ReadAllBytes(outUexpPath);
+        int inlineStart = newMips[0].BulkData.Data.Length > 0 ? IndexOfBytes(outBytes, newMips[0].BulkData.Data) : -1;
+        if (inlineStart >= 0)
+        {
+            long off = inlineStart;
+            var fixedDR = new List<FObjectDataResource>();
+            foreach (var d in newDR)
+            {
+                fixedDR.Add(new FObjectDataResource(d.Flags, off, -1, d.SerialSize, d.RawSize, d.OuterIndex, d.LegacyBulkDataFlags, d.CookedIndex));
+                off += d.RawSize;
+            }
+            asset.DataResources = fixedDR;
+            asset.Write(output);
+            Console.WriteLine($"Pass2: inline data starts at .uexp offset {inlineStart}; SerialOffsets fixed");
+        }
+        long outUexp = new FileInfo(outUexpPath).Length;
+        Console.WriteLine($"Wrote {output}: .uexp={outUexp:N0} bytes");
+
+        // Re-parse to verify structural validity
+        var asset2 = LoadAsset(output, usmap);
+        var tex2 = asset2.Exports.OfType<TextureExport>().FirstOrDefault();
+        if (tex2?.PlatformData == null) Console.WriteLine("RE-PARSE: FAILED (no PlatformData)");
+        else Console.WriteLine($"RE-PARSE: OK -> {tex2.PlatformData.SizeX}x{tex2.PlatformData.SizeY}, {tex2.PlatformData.Mips.Count} mips, DataResources={asset2.DataResources?.Count}");
+        return 0;
+    }
+
+    private static int CliProbeChunks(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool probe_chunks <paks_dir> <name_substr> [--aes <key>]");
+            return 1;
+        }
+        string paksDir = args[1];
+        string needle = args[2];
+        byte[]? aes = null;
+        for (int i = 3; i < args.Length; i++)
+            if (args[i] == "--aes" && i + 1 < args.Length) aes = IoStore.IoStoreReader.ParseAesKey(args[++i]);
+
+        var utocs = Directory.Exists(paksDir)
+            ? Directory.GetFiles(paksDir, "*.utoc")
+            : new[] { paksDir };
+
+        var readers = new List<(string name, IoStore.IoStoreReader r)>();
+        foreach (var u in utocs)
+        {
+            try { readers.Add((Path.GetFileName(u), new IoStore.IoStoreReader(u, aes))); }
+            catch
+            {
+                try { readers.Add((Path.GetFileName(u), new IoStore.IoStoreReader(u, (byte[]?)null))); }
+                catch (Exception ex) { Console.Error.WriteLine($"  (skip {Path.GetFileName(u)}: {ex.Message})"); }
+            }
+        }
+
+        // Step 1: resolve the package id from the ExportBundleData chunk whose path matches the needle
+        ulong pkgId = 0; string? pkgPath = null; string? foundIn = null;
+        foreach (var (name, r) in readers)
+        {
+            foreach (var c in r.GetChunks())
+            {
+                if (c.GetChunkType() != IoStore.EIoChunkType.ExportBundleData) continue;
+                var p = r.GetChunkPath(c);
+                if (p != null && p.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                { pkgId = c.Id; pkgPath = p; foundIn = name; break; }
+            }
+            if (pkgId != 0) break;
+        }
+        if (pkgId == 0)
+        {
+            Console.WriteLine($"No ExportBundleData package matching '{needle}' found in {readers.Count} containers.");
+            foreach (var (_, r) in readers) r.Dispose();
+            return 1;
+        }
+        Console.WriteLine($"Package match: id=0x{pkgId:X16}  container={foundIn}");
+        Console.WriteLine($"  path={pkgPath}");
+        Console.WriteLine($"Chunks sharing this package id across all {readers.Count} containers:");
+
+        // Step 2: every chunk (any type) with this id, in any container
+        int total = 0;
+        foreach (var (name, r) in readers)
+        {
+            foreach (var c in r.GetChunks())
+            {
+                if (c.Id != pkgId) continue;
+                long size = -1;
+                try { size = r.ReadChunk(c).Length; } catch { }
+                Console.WriteLine($"  [{name}] type={c.GetChunkType()} index={c.Index} size={(size >= 0 ? size.ToString("N0") : "?")}");
+                total++;
+            }
+        }
+        Console.WriteLine($"Total chunks for package: {total}");
+        foreach (var (_, r) in readers) r.Dispose();
+        return 0;
+    }
+
     private static int CliListIoStore(string[] args)
     {
         if (args.Length < 2)
@@ -7600,6 +7802,31 @@ public partial class Program
         }
     }
     
+    private static int CliInjectTextureObj(string[] args)
+    {
+        if (args.Length < 4)
+        {
+            Console.Error.WriteLine("Usage: UAssetTool inject_texture_obj <base_uasset> <image> <output_uasset> [--no-mips] [--usmap <path>]");
+            return 1;
+        }
+        string baseUasset = args[1], imageFile = args[2], outputPath = args[3];
+        bool generateMips = true; string? usmapPath = null;
+        for (int i = 4; i < args.Length; i++)
+        {
+            if (args[i] == "--no-mips") generateMips = false;
+            else if (args[i] == "--usmap" && i + 1 < args.Length) usmapPath = args[++i];
+        }
+        Console.WriteLine($"Injecting (object model): {imageFile} -> {outputPath}");
+        var r = Texture.TextureInjector.InjectObjectModel(baseUasset, imageFile, outputPath, generateMips, usmapPath);
+        if (r.Success)
+        {
+            Console.WriteLine($"Success! {r.Width}x{r.Height}, {r.MipCount} mips, {r.PixelFormat}, {r.TotalDataSize:N0} bytes");
+            return 0;
+        }
+        Console.Error.WriteLine($"Failed: {r.ErrorMessage}");
+        return 1;
+    }
+
     private static int CliInjectTexture(string[] args)
     {
         if (args.Length < 4)

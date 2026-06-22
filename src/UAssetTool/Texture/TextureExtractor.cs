@@ -156,7 +156,7 @@ public class TextureExtractor
             // by UAssetAPI because it lives in external .ubulk or inline in .uexp
             if (pixelData == null || pixelData.Length == 0)
             {
-                pixelData = ReadMipDataFromFiles(asset, mip, uassetPath);
+                pixelData = ReadMipDataFromFiles(asset, mip, uassetPath, mipIndex);
             }
             
             // Validate data size - if wrong for this mip's dimensions, treat as missing
@@ -179,15 +179,17 @@ public class TextureExtractor
                     int tryH = tryMip.SizeY > 0 ? tryMip.SizeY : sizeY >> m;
                     int tryExpected = CalculateDataSize(tryW, tryH, pixelFormat);
                     
-                    // Try GetData first, then ReadMipDataFromFiles
+                    // Try GetData first, then ReadMipDataFromFiles (by positional index m,
+                    // since the per-mip DataResourceIndex is unreliable for MR textures)
                     byte[] tryData = tryMip.GetData();
                     if (tryData == null || tryData.Length < tryExpected)
-                        tryData = ReadMipDataFromFiles(asset, tryMip, uassetPath);
+                        tryData = ReadMipDataFromFiles(asset, tryMip, uassetPath, m);
                     if (tryData == null || tryData.Length < tryExpected)
                         continue;
-                    
+
                     fallbackMip = m;
-                    fallbackData = tryData;
+                    // Slice to exactly this mip's size so we never decode trailing/foreign bytes
+                    fallbackData = tryData.Length > tryExpected ? tryData[..tryExpected] : tryData;
                     break;
                 }
                 
@@ -348,20 +350,27 @@ public class TextureExtractor
     /// <summary>
     /// Read mip pixel data from .ubulk or .uexp files using DataResource metadata.
     /// </summary>
-    private static byte[] ReadMipDataFromFiles(UAsset asset, FTexture2DMipMap mip, string uassetPath)
+    private static byte[] ReadMipDataFromFiles(UAsset asset, FTexture2DMipMap mip, string uassetPath, int dataResourceIndexOverride = -1)
     {
         var header = mip.BulkData?.Header;
-        if (header == null) return Array.Empty<byte>();
-        
+        // The per-mip DataResourceIndex parsed from the .uexp is unreliable for MR textures
+        // (only mip0 parses correctly; mips 1+ read dimension bytes as the index). The caller passes
+        // the mip's positional index, which maps 1:1 to asset.DataResources. Prefer it when given.
+        int drIndex = dataResourceIndexOverride >= 0 ? dataResourceIndexOverride : (header?.DataResourceIndex ?? -1);
+        if (header == null && drIndex < 0) return Array.Empty<byte>();
+
         // Try DataResources approach (UE5.3+)
-        if (header.DataResourceIndex >= 0 && asset.DataResources != null && header.DataResourceIndex < asset.DataResources.Count)
+        if (drIndex >= 0 && asset.DataResources != null && drIndex < asset.DataResources.Count)
         {
-            var dr = asset.DataResources[header.DataResourceIndex];
+            var dr = asset.DataResources[drIndex];
             int size = (int)dr.RawSize;
             if (size <= 0) return Array.Empty<byte>();
-            
-            // Check if data is inline (in .uexp) or external (.ubulk)
-            bool isInline = (dr.Flags & EObjectDataResourceFlags.Inline) != 0;
+
+            // Route by the authoritative legacy bulk flags: MR sets dr.Flags=None and stores the real
+            // intent in LegacyBulkDataFlags, so check ForceInlinePayload (.uexp) there too.
+            const uint BULKDATA_ForceInlinePayload = 0x40;
+            bool isInline = (dr.Flags & EObjectDataResourceFlags.Inline) != 0
+                            || (dr.LegacyBulkDataFlags & BULKDATA_ForceInlinePayload) != 0;
             
             if (isInline)
             {
@@ -375,7 +384,7 @@ public class TextureExtractor
                     {
                         byte[] data = new byte[size];
                         Array.Copy(uexpBytes, offset, data, 0, size);
-                        Console.WriteLine($"  Read {size} bytes from .uexp DataResource[{header.DataResourceIndex}] at offset {offset}");
+                        Console.WriteLine($"  Read {size} bytes from .uexp DataResource[{drIndex}] at offset {offset}");
                         return data;
                     }
                 }
@@ -397,7 +406,7 @@ public class TextureExtractor
                     {
                         byte[] data = new byte[size];
                         Array.Copy(bulkBytes, offset, data, 0, size);
-                        Console.WriteLine($"  Read {size} bytes from {ext} DataResource[{header.DataResourceIndex}] at offset {offset}");
+                        Console.WriteLine($"  Read {size} bytes from {ext} DataResource[{drIndex}] at offset {offset}");
                         return data;
                     }
                     // If offset is out of range, file might contain just this mip's data
@@ -419,7 +428,7 @@ public class TextureExtractor
                     {
                         byte[] data = new byte[size];
                         Array.Copy(uexpBytes, offset, data, 0, size);
-                        Console.WriteLine($"  Read {size} bytes from .uexp fallback DataResource[{header.DataResourceIndex}] at offset {offset}");
+                        Console.WriteLine($"  Read {size} bytes from .uexp fallback DataResource[{drIndex}] at offset {offset}");
                         return data;
                     }
                 }
@@ -427,7 +436,7 @@ public class TextureExtractor
         }
         
         // Fallback: try legacy bulk data header approach
-        if (header.ElementCount > 0)
+        if (header != null && header.ElementCount > 0)
         {
             if (header.IsInSeparateFile)
             {

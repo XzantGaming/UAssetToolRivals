@@ -169,50 +169,44 @@ namespace UAssetAPI.ExportTypes.Texture
             // First mip to serialize
             writer.Write(FirstMipToSerialize);
 
-            // Write mipmap count and mipmaps (headers only for UE5.3+ with DataResources)
+            // Write mipmap count
             writer.Write(Mips.Count);
-            foreach (var mip in Mips)
-            {
-                mip.Write(writer);
-            }
 
             // Check if using UE5.3+ DataResource format
             bool hasDataResources = Mips.Count > 0 && Mips[0].BulkData?.Header?.DataResourceIndex >= 0;
 
-            if (!hasDataResources)
-            {
-                // Legacy format: bIsVirtual comes after mip headers, before pixel data
-                writer.Write(bIsVirtual ? 1 : 0);
-            }
-
-            // Write mip pixel data after all headers
-            // For UE5.3+ with DataResources, the DataResource's SerialOffset points to this location
-            // For legacy format, inline data is written by FByteBulkData.Write()
-            foreach (var mip in Mips)
-            {
-                // Write pixel data if it's inline (either via DataResourceIndex or IsInline flag)
-                if (mip.BulkData?.Data != null && mip.BulkData.Data.Length > 0)
-                {
-                    bool shouldWriteHere = mip.BulkData.Header?.DataResourceIndex >= 0 || 
-                                           mip.BulkData.Header?.IsInline == true;
-                    if (shouldWriteHere)
-                    {
-                        mip.BulkData.WriteData(writer);
-                    }
-                }
-            }
-
-            // For UE5.3+ DataResource format: write mip dimensions AFTER pixel data
             if (hasDataResources)
             {
+                // UE5.3+ cooked format is INTERLEAVED per mip:
+                //   [DataResourceIndex(4)] [inline pixel data, if any] [SizeX(4)] [SizeY(4)] [SizeZ(4)]
+                // Streaming/optional mips have no inline data (their pixels live in .ubulk/.uptnl), so only
+                // the index + dims are written for them. bIsVirtual follows the last mip.
                 foreach (var mip in Mips)
                 {
+                    mip.BulkData.Write(writer); // writes the 4-byte DataResourceIndex
+                    if (mip.BulkData?.Data != null && mip.BulkData.Data.Length > 0)
+                        mip.BulkData.WriteData(writer);
                     writer.Write(mip.SizeX);
                     writer.Write(mip.SizeY);
                     writer.Write(mip.SizeZ);
                 }
-                // bIsVirtual comes after dimensions
                 writer.Write(bIsVirtual ? 1 : 0);
+            }
+            else
+            {
+                // Legacy format: all mip headers, then bIsVirtual, then inline pixel data.
+                foreach (var mip in Mips)
+                {
+                    mip.Write(writer);
+                }
+                writer.Write(bIsVirtual ? 1 : 0);
+                foreach (var mip in Mips)
+                {
+                    if (mip.BulkData?.Data != null && mip.BulkData.Data.Length > 0 && mip.BulkData.Header?.IsInline == true)
+                    {
+                        mip.BulkData.WriteData(writer);
+                    }
+                }
             }
         }
 

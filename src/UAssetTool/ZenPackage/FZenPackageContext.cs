@@ -571,21 +571,72 @@ public class FZenPackageContext : IDisposable
     }
 
     /// <summary>
-    /// Read optional bulk data (high-res mips) for a package.
-    /// Uses path-based resolution since optional containers use different chunk IDs.
+    /// Read optional bulk data (high-res mips, e.g. the Marvel Rivals High-Res DLC) for a package.
+    /// These live in *optional containers as bare OptionalBulkData chunks keyed by the SAME package id
+    /// (no export bundle, no directory-index path), so we resolve by package id + chunk type across all
+    /// containers first — exactly like ReadBulkData does for .ubulk. The legacy path-based lookup remains
+    /// as a fallback for layouts that DO expose a .uptnl path entry.
     /// </summary>
     public byte[]? ReadOptionalBulkData(ulong packageId, int containerIndex = -1)
     {
-        return ReadBulkDataByPath(packageId, ".uptnl", containerIndex);
+        return ReadBulkDataById(packageId, IoStore.EIoChunkType.OptionalBulkData)
+               ?? ReadBulkDataByPath(packageId, ".uptnl", containerIndex);
     }
-    
+
     /// <summary>
-    /// Read memory-mapped bulk data for a package.
-    /// Uses path-based resolution since optional containers use different chunk IDs.
+    /// Read memory-mapped bulk data for a package. Resolves by package id + chunk type across all
+    /// containers first (bare chunks have no path entry), falling back to path-based lookup.
     /// </summary>
     public byte[]? ReadMemoryMappedBulkData(ulong packageId, int containerIndex = -1)
     {
-        return ReadBulkDataByPath(packageId, ".m.ubulk", containerIndex);
+        return ReadBulkDataById(packageId, IoStore.EIoChunkType.MemoryMappedBulkData)
+               ?? ReadBulkDataByPath(packageId, ".m.ubulk", containerIndex);
+    }
+
+    /// <summary>
+    /// Find all chunks of a given type sharing a package id across EVERY loaded container, sorted by
+    /// chunk index and concatenated. Returns null if none exist. Used for bulk payloads that may live in
+    /// a different container than the package's ExportBundleData (e.g. *optional High-Res DLC containers).
+    /// </summary>
+    private byte[]? ReadBulkDataById(ulong packageId, IoStore.EIoChunkType chunkType)
+    {
+        bool debug = Environment.GetEnvironmentVariable("DEBUG_BULK") == "1";
+        var parts = new List<(int Container, ushort Index, byte[] Data)>();
+        for (int ci = 0; ci < _containers.Count; ci++)
+        {
+            var reader = _containers[ci];
+            foreach (var chunk in reader.GetChunks())
+            {
+                if (chunk.Id != packageId || chunk.GetChunkType() != chunkType) continue;
+                try
+                {
+                    byte[] data = reader.ReadChunk(chunk);
+                    if (data != null && data.Length > 0)
+                        parts.Add((ci, chunk.Index, data));
+                }
+                catch (Exception ex)
+                {
+                    if (debug)
+                        Console.Error.WriteLine($"[DEBUG_BULK]   {chunkType} read failed in container[{ci}] ({reader.ContainerName}): {ex.Message}");
+                }
+            }
+        }
+        if (parts.Count == 0) return null;
+
+        parts.Sort((a, b) => a.Index != b.Index ? a.Index.CompareTo(b.Index) : a.Container.CompareTo(b.Container));
+        if (debug)
+            Console.Error.WriteLine($"[DEBUG_BULK]   {chunkType} for 0x{packageId:X16}: {parts.Count} chunk(s), {parts.Sum(p => p.Data.Length)} bytes (by id)");
+        if (parts.Count == 1) return parts[0].Data;
+
+        int total = parts.Sum(p => p.Data.Length);
+        byte[] result = new byte[total];
+        int offset = 0;
+        foreach (var (_, _, data) in parts)
+        {
+            Array.Copy(data, 0, result, offset, data.Length);
+            offset += data.Length;
+        }
+        return result;
     }
     
     /// <summary>

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using BCnEncoder.Encoder;
 using BCnEncoder.Shared;
 using BCnEncoder.ImageSharp;
@@ -13,6 +14,7 @@ using UAssetAPI.ExportTypes;
 using UAssetAPI.ExportTypes.Texture;
 using UAssetAPI.UnrealTypes;
 using UAssetAPI.Unversioned;
+using UAssetAPI.PropertyTypes.Structs;
 
 namespace UAssetTool.Texture;
 
@@ -346,6 +348,175 @@ public class TextureInjector
     }
     
     /// <summary>
+    /// Inject an image using the UAssetAPI object model (no binary patching). Rebuilds the texture's
+    /// platform data as an all-inline multi-mip chain: self-contained (no .ubulk/.uptnl dependency),
+    /// DLC-independent, dimension-adapting. Preserves the base texture's pixel format for FName
+    /// compatibility. Two-pass write fixes inline DataResource SerialOffsets to their real positions.
+    /// </summary>
+    public static TextureInjectionResult InjectObjectModel(
+        string baseUassetPath, string imagePath, string outputPath,
+        bool generateMips = true, string? usmapPath = null)
+    {
+        var result = new TextureInjectionResult();
+        try
+        {
+            if (!File.Exists(baseUassetPath)) { result.ErrorMessage = $"Base uasset not found: {baseUassetPath}"; return result; }
+            Usmap? mappings = (!string.IsNullOrEmpty(usmapPath) && File.Exists(usmapPath)) ? new Usmap(usmapPath) : null;
+            var asset = new UAsset(baseUassetPath, EngineVersion.VER_UE5_3, mappings);
+            asset.UseSeparateBulkDataFiles = true;
+
+            TextureExport? tex = null;
+            foreach (var e in asset.Exports) if (e is TextureExport t) { tex = t; break; }
+            if (tex?.PlatformData == null) { result.ErrorMessage = "Base asset has no parseable texture platform data (usmap required for unversioned assets)."; return result; }
+            var pd = tex.PlatformData;
+
+            // Keep the base texture's format so the PixelFormat FName stays valid.
+            var fmt = DetectFormatFromUEName(pd.PixelFormat) ?? TextureCompressionFormat.BC7;
+
+            using var image = LoadImage(imagePath);
+            if (image == null) { result.ErrorMessage = $"Failed to load image: {imagePath}"; return result; }
+            Console.WriteLine($"  Base format: {pd.PixelFormat} ({fmt}); new image: {image.Width}x{image.Height}");
+
+            // Full mip chain DOWN TO 1x1 (cooked UE convention; the engine derives mip count from
+            // dimensions and reads the whole chain — a truncated chain causes access violations).
+            var mipImages = generateMips ? GenerateFullMipChain(image) : new List<Image<Rgba32>> { image.Clone() };
+            var compressed = CompressMipmaps(mipImages, fmt);
+            foreach (var mi in mipImages) mi.Dispose();
+            Console.WriteLine($"  Generated {compressed.Count} mip(s): {string.Join(", ", compressed.Select(c => $"{c.Width}x{c.Height}"))}");
+
+            // Keep the ImportedSize property in sync with the new dimensions (engine reads it).
+            foreach (var prop in tex.Data)
+            {
+                if (prop is StructPropertyData sp && sp.Name?.Value?.Value == "ImportedSize"
+                    && sp.Value.Count > 0 && sp.Value[0] is IntPointPropertyData ip)
+                {
+                    ip.Value = new[] { image.Width, image.Height };
+                    Console.WriteLine($"  ImportedSize -> [{image.Width}, {image.Height}]");
+                }
+            }
+
+            var origDR = asset.DataResources ?? new List<FObjectDataResource>();
+            var outer = origDR.Count > 0 ? origDR[0].OuterIndex : FPackageIndex.FromRawIndex(0);
+
+            var newMips = new List<FTexture2DMipMap>();
+            var newDR = new List<FObjectDataResource>();
+            // Inline (resident) mips: EObjectDataResourceFlags=None, LegacyBulkDataFlags = ForceInlinePayload|SingleUse
+            // (0x48=72) — matches a real cooked texture; the game reads intent from LegacyBulkDataFlags.
+            const EBulkDataFlags INLINE_FLAGS = EBulkDataFlags.BULKDATA_ForceInlinePayload | EBulkDataFlags.BULKDATA_SingleUse;
+            // Streaming mips → .ubulk: PayloadAtEndOfFile|PayloadInSeperateFile|Force_NOT_InlinePayload|NoOffsetFixUp (0x10501).
+            // Optional (high-res) mips → .uptnl: same + OptionalPayload (0x800) = 0x10D01. Matches the cooked layout:
+            // the largest mip(s) are optional (.uptnl), mid mips stream (.ubulk), the smallest stay inline (.uexp).
+            const uint STREAM_FLAGS = 0x10501;
+            const uint OPTIONAL_FLAGS = 0x10D01;
+            bool streaming = generateMips;   // Mode B; Mode A (no mips) = single inline mip
+            var ubulk = new MemoryStream();
+            var uptnl = new MemoryStream();
+            for (int i = 0; i < compressed.Count; i++)
+            {
+                var c = compressed[i];
+                int maxDim = Math.Max(c.Width, c.Height);
+                if (!streaming || maxDim <= 64)
+                {
+                    // Inline (resident) in .uexp
+                    var bd = new FByteBulkData(c.Data);
+                    bd.Header.DataResourceIndex = i;
+                    bd.Header.BulkDataFlags = INLINE_FLAGS;
+                    newMips.Add(new FTexture2DMipMap(bd, c.Width, c.Height, 1));
+                    newDR.Add(new FObjectDataResource(EObjectDataResourceFlags.None, 0, -1, c.Data.Length, c.Data.Length, outer, (uint)INLINE_FLAGS, 0));
+                }
+                else if (maxDim > 1024)
+                {
+                    // Optional high-res mip → .uptnl (empty inline Data; pixels go to .uptnl)
+                    var bd = new FByteBulkData(Array.Empty<byte>());
+                    bd.Header.DataResourceIndex = i;
+                    bd.Header.BulkDataFlags = (EBulkDataFlags)OPTIONAL_FLAGS;
+                    newMips.Add(new FTexture2DMipMap(bd, c.Width, c.Height, 1));
+                    newDR.Add(new FObjectDataResource(EObjectDataResourceFlags.None, uptnl.Length, -1, c.Data.Length, c.Data.Length, outer, OPTIONAL_FLAGS, 0));
+                    uptnl.Write(c.Data, 0, c.Data.Length);
+                }
+                else
+                {
+                    // Streaming mip → .ubulk (empty inline Data; pixels go to .ubulk)
+                    var bd = new FByteBulkData(Array.Empty<byte>());
+                    bd.Header.DataResourceIndex = i;
+                    bd.Header.BulkDataFlags = (EBulkDataFlags)STREAM_FLAGS;
+                    newMips.Add(new FTexture2DMipMap(bd, c.Width, c.Height, 1));
+                    newDR.Add(new FObjectDataResource(EObjectDataResourceFlags.None, ubulk.Length, -1, c.Data.Length, c.Data.Length, outer, STREAM_FLAGS, 0));
+                    ubulk.Write(c.Data, 0, c.Data.Length);
+                }
+            }
+            pd.Mips = newMips;
+            pd.SizeX = image.Width; pd.SizeY = image.Height;
+            pd.FirstMipToSerialize = 0;
+            pd.bIsVirtual = false;   // injected textures are regular Texture2D, NOT virtual textures
+            asset.DataResources = newDR;
+
+            string outDir = Path.GetDirectoryName(outputPath) ?? ".";
+            if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+            asset.Write(outputPath);
+
+            // Write/clear .ubulk (streaming) and .uptnl (optional). Mode A leaves neither.
+            string ubulkPath = Path.ChangeExtension(outputPath, ".ubulk");
+            if (ubulk.Length > 0) { File.WriteAllBytes(ubulkPath, ubulk.ToArray()); Console.WriteLine($"  .ubulk: {ubulk.Length:N0} bytes"); }
+            else if (File.Exists(ubulkPath)) File.Delete(ubulkPath);
+            string uptnlPath = Path.ChangeExtension(outputPath, ".uptnl");
+            if (uptnl.Length > 0) { File.WriteAllBytes(uptnlPath, uptnl.ToArray()); Console.WriteLine($"  .uptnl: {uptnl.Length:N0} bytes"); }
+            else if (File.Exists(uptnlPath)) File.Delete(uptnlPath);
+
+            // Pass 2: set inline DataResource SerialOffsets to their real .uexp positions (streaming
+            // offsets already point into .ubulk). Find where the first inline mip's data landed.
+            string outUexp = Path.ChangeExtension(outputPath, ".uexp");
+            byte[] outBytes = File.ReadAllBytes(outUexp);
+            int firstInline = newMips.FindIndex(m => m.BulkData.Data.Length > 0);
+            int inlineStart = firstInline >= 0 ? IndexOfBytes(outBytes, newMips[firstInline].BulkData.Data) : -1;
+            if (inlineStart >= 0)
+            {
+                long off = inlineStart;
+                for (int i = 0; i < newDR.Count; i++)
+                {
+                    if (newMips[i].BulkData.Data.Length > 0) // inline mip → patch .uexp offset
+                    {
+                        var d = newDR[i];
+                        newDR[i] = new FObjectDataResource(d.Flags, off, -1, d.SerialSize, d.RawSize, d.OuterIndex, d.LegacyBulkDataFlags, d.CookedIndex);
+                        // Interleaved layout: next inline mip's data sits after this mip's dims (12) + the next mip's index (4).
+                        off += d.RawSize + 16;
+                    }
+                    // streaming mips keep their .ubulk offset
+                }
+                asset.DataResources = newDR;
+                asset.Write(outputPath);
+                Console.WriteLine($"  Inline data at .uexp offset {inlineStart}; SerialOffsets fixed");
+            }
+
+            result.Success = true;
+            result.Width = image.Width; result.Height = image.Height;
+            result.MipCount = newMips.Count;
+            result.PixelFormat = GetUEPixelFormatName(fmt);
+            result.TotalDataSize = compressed.Sum(c => (long)c.Data.Length);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.ErrorMessage = $"InjectObjectModel failed: {ex.Message}\n{ex.StackTrace}";
+            return result;
+        }
+    }
+
+    /// <summary>Find the first offset of needle within haystack (needle is large/unique here).</summary>
+    private static int IndexOfBytes(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0 || needle.Length > haystack.Length) return -1;
+        int last = haystack.Length - needle.Length;
+        for (int i = 0; i <= last; i++)
+        {
+            int j = 0;
+            while (j < needle.Length && haystack[i + j] == needle[j]) j++;
+            if (j == needle.Length) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>
     /// Find the FString pixel format in the .uexp binary.
     /// Searches for known pixel format strings like "PF_DXT1", "PF_DXT5", "PF_BC7", etc.
     /// </summary>
@@ -528,6 +699,24 @@ public class TextureInjector
         return result;
     }
     
+    /// <summary>
+    /// Generate the FULL mipmap chain down to 1x1 (cooked UE convention), e.g. 4096 -> 13 mips.
+    /// </summary>
+    private static List<Image<Rgba32>> GenerateFullMipChain(Image<Rgba32> source)
+    {
+        var mips = new List<Image<Rgba32>> { source.Clone() };
+        int width = source.Width, height = source.Height;
+        while (width > 1 || height > 1)
+        {
+            width = Math.Max(1, width / 2);
+            height = Math.Max(1, height / 2);
+            var mip = source.Clone();
+            mip.Mutate(x => x.Resize(width, height));
+            mips.Add(mip);
+        }
+        return mips;
+    }
+
     /// <summary>
     /// Generate mipmap chain from source image.
     /// </summary>

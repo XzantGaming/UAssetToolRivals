@@ -242,7 +242,7 @@ namespace UAssetAPI.ExportTypes.Texture
                     reader.BaseStream.Position = checkPos;
                     
                     // If the first 4 bytes are 0 and the next 8 bytes give a reasonable skip offset, skip the extra bytes
-                    if (potentialExtra == 0 && potentialSkipOffset > 0 && potentialSkipOffset < 100000)
+                    if (potentialExtra == 0 && potentialSkipOffset > 0 && potentialSkipOffset < int.MaxValue)
                     {
                         ExtraBytes = reader.ReadBytes(4); // Store for round-trip
                     }
@@ -372,7 +372,7 @@ namespace UAssetAPI.ExportTypes.Texture
                 long potentialSkipOffset = reader.ReadInt64();
                 reader.BaseStream.Position = checkPos;
                 
-                if (potentialExtra == 0 && potentialSkipOffset > 0 && potentialSkipOffset < 100000)
+                if (potentialExtra == 0 && potentialSkipOffset > 0 && potentialSkipOffset < int.MaxValue)
                 {
                     ExtraBytes = reader.ReadBytes(4);
                 }
@@ -443,7 +443,7 @@ namespace UAssetAPI.ExportTypes.Texture
                 long potentialSkipOffset = reader.ReadInt64();
                 reader.BaseStream.Position = checkPos;
                 
-                if (potentialExtra == 0 && potentialSkipOffset > 0 && potentialSkipOffset < 100000)
+                if (potentialExtra == 0 && potentialSkipOffset > 0 && potentialSkipOffset < int.MaxValue)
                 {
                     ExtraBytes = reader.ReadBytes(4);
                 }
@@ -732,6 +732,9 @@ namespace UAssetAPI.ExportTypes.Texture
             PropertyData bit;
 
             var unversionedHeader = new FUnversionedHeader(reader);
+            // Preserve the exact header so Write() reproduces it byte-for-byte instead of regenerating
+            // a different (and parse-breaking) one. NormalExport.Read does this; the texture path missed it.
+            OriginalUnversionedHeader = unversionedHeader;
             if (!reader.Asset.HasUnversionedProperties && reader.Asset.ObjectVersionUE5 >= ObjectVersionUE5.PROPERTY_TAG_EXTENSION_AND_OVERRIDABLE_SERIALIZATION)
             {
                 SerializationControl = (EClassSerializationControlExtension)reader.ReadByte();

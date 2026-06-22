@@ -1394,10 +1394,16 @@ public class ZenConverter
         {
             // Validate that bulk data map entries fit within the .ubulk file
             // If they don't, create a single entry covering the entire .ubulk
+            // Only resources that actually live in the .ubulk file should be bounds-checked against it.
+            // Optional (.uptnl, OptionalPayload 0x800) and inline (.uexp, ForceInlinePayload 0x40) resources
+            // have offsets in OTHER files, so checking them against ubulkSize would falsely fail.
             bool entriesValid = true;
             foreach (var resource in asset.DataResources)
             {
-                if (resource.SerialOffset + resource.SerialSize > ubulkSize)
+                bool inUbulk = (resource.LegacyBulkDataFlags & 0x100) != 0   // PayloadInSeperateFile
+                               && (resource.LegacyBulkDataFlags & 0x800) == 0 // not OptionalPayload (.uptnl)
+                               && (resource.LegacyBulkDataFlags & 0x40) == 0; // not ForceInlinePayload (.uexp)
+                if (inUbulk && resource.SerialOffset + resource.SerialSize > ubulkSize)
                 {
                     entriesValid = false;
                     break;
