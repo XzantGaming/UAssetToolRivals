@@ -604,25 +604,33 @@ The Zen `BulkDataMapEntry.Flags` field determines where each bulk data chunk is 
 
 ### OptionalBulkData Container Separation
 
-**Critical discovery:** Marvel Rivals stores OptionalBulkData (highest-res texture mips) in **separate IoStore containers** from the ExportBundleData. For example:
-- ExportBundleData + BulkData → `pakchunk0-WindowsClient.utoc`
-- OptionalBulkData → `pakchunk0_s1-WindowsClient.utoc` (separate optional container)
+**Critical discovery:** Marvel Rivals' **High-Resolution texture DLC** stores OptionalBulkData (highest-res mips) in **separate `*optional` IoStore containers**. For example:
+- ExportBundleData + BulkData → `pakchunkCharacter-Windows.utoc`
+- OptionalBulkData → `pakchunkCharacteroptional-Windows.utoc` (the High-Res DLC container)
 
-`ReadOptionalBulkData()` in `FZenPackageContext` searches ALL loaded containers for OptionalBulkData chunks, not just the container that owns the ExportBundleData.
+These are **bare** `OptionalBulkData` chunks keyed by the same package id — no ExportBundleData and no directory-index path entry. `ReadOptionalBulkData()` in `FZenPackageContext` therefore resolves them by **package id + chunk type across ALL loaded containers** (`ReadBulkDataById`), *not* by path, so it finds the DLC chunk regardless of which container owns the ExportBundleData. When the DLC is disabled the optional (top) mip is simply absent and the engine falls back to the highest mip present.
 
-### Texture Injection Pipeline
+### Texture Injection Pipeline (`TextureInjector.InjectObjectModel`)
+
+No binary patching — the texture is rebuilt through UAssetAPI's object model into the exact cooked layout the engine expects. The pixel format is preserved from the base texture (keeps the `PixelFormat` FName valid).
 
 ```
-1. Load base .uasset with UAssetAPI (preserves all metadata)
+1. Load base .uasset with UAssetAPI + usmap; get TextureExport.PlatformData
 2. Load input image (PNG/TGA/DDS/BMP) with ImageSharp
-3. Resize if needed to match base texture dimensions
-4. Generate mipchain (halving dimensions each level)
-5. Compress each mip with BCnEncoder (BC1/BC3/BC5/BC7)
-6. Replace PlatformData mip array with new compressed mips
-7. Set all mips as inline (ForceInlinePayload flag)
-8. Update DataResources to match new mip layout
-9. Save modified .uasset + .uexp
+3. Build the mip chain (Mode B: full chain to 1x1; Mode A: single mip) + BCn-compress each
+4. Update the ImportedSize property; set bIsVirtual = false
+5. Split mips by the cooked convention and build Mips + DataResources:
+     maxDim > 1024     -> .uptnl  (optional,  LegacyBulkDataFlags 0x10D01)   [Mode B]
+     64 < maxDim <=1024 -> .ubulk (streaming, 0x10501)                       [Mode B]
+     maxDim <= 64      -> inline in .uexp (ForceInlinePayload|SingleUse 0x48)  [Mode A = the single mip]
+   Streamed/optional mips carry EMPTY inline Data so only their 4-byte header is written to .uexp.
+6. asset.Write() -> .uasset/.uexp; write .ubulk + .uptnl files for the external mips
+7. Two-pass: find where the inline data landed in .uexp, set the inline DataResource SerialOffsets
 ```
+
+**Two critical correctness requirements** (both caused in-game crashes before being fixed):
+- **`bIsVirtual` must be `false`** for a regular Texture2D. A stray `1` (it was being misread during extraction and carried over) makes the engine deserialize an `FVirtualTextureBuiltData` from the mip bytes → serial-size mismatch / access violation.
+- The platform-data mip layout is **interleaved per mip** (see next section). All-inline multi-mip, or "all indices then all data then all dims", crashes — the engine reads `[index][inline pixels][dims]` per mip.
 
 ### Texture Extraction Pipeline
 
@@ -652,12 +660,20 @@ The Zen `BulkDataMapEntry.Flags` field determines where each bulk data chunk is 
 
 Textures like UI hero portraits (`img_squarehead_*`) have all mip data inline in `.uexp` with no `.ubulk`. The UE5.3+ DataResources format differs from legacy bulk data:
 
-**Key differences from legacy format:**
-- Each mip header is just a **4-byte DataResourceIndex** (no dimensions, no inline data)
-- Mip dimensions are derived from PlatformData header `SizeX`/`SizeY >> mipLevel`
-- `FTexturePlatformData` skips exactly **16 bytes** of PlaceholderDerivedData (not a heuristic)
-- `bIsVirtual` follows immediately after all mip DR index headers
-- Pixel data location determined by `FObjectDataResource.SerialOffset` in `.uexp` or `.ubulk`
+**Mip layout — INTERLEAVED per mip** (the real cooked format, verified byte-for-byte against game textures):
+
+```
+[FirstMipToSerialize][MipCount]
+for each mip:  [DataResourceIndex (4)] [inline pixel data, if inline] [SizeX (4)] [SizeY (4)] [SizeZ (4)]
+[bIsVirtual (4)]
+```
+
+- Streaming (`.ubulk`) and optional (`.uptnl`) mips write only their 4-byte index + dims here; their pixels live in the external file at `FObjectDataResource.SerialOffset`.
+- Inline mips embed their pixels *between* the index and the dims, so consecutive inline mips sit **16 bytes** apart (12 dims + 4 next index).
+- `FTexturePlatformData` skips exactly **16 bytes** of PlaceholderDerivedData first.
+- Mip dimensions can also be derived as `SizeX`/`SizeY >> mipLevel`.
+
+> ⚠️ The reader still reads N *consecutive* 4-byte indices (the older "separated" assumption), which mis-aligns the per-mip `DataResourceIndex` and `bIsVirtual` for multi-mip textures. Extraction works around this via the asset-level `DataResources` array (positional `mip i → DataResources[i]`) plus the skip offset. The **writer** (`FTexturePlatformData.Write`) was corrected to emit the proper interleaved layout — this is what makes injected multi-mip textures load in-game.
 
 **Parsing fixes applied:**
 | Component | Fix |

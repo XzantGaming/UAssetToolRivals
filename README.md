@@ -8,7 +8,7 @@ A CLI tool for parsing, editing, and converting Unreal Engine 5 assets. Built on
 - **IoStore Extraction** - Extract game assets from IoStore containers to legacy `.uasset`/`.uexp`/`.ubulk`/`.uptnl` format
 - **PAK Extraction** - Extract assets from legacy PAK files (Oodle, Zlib, Zstd, AES encryption)
 - **JSON Conversion** - Export `.uasset` to JSON and back for easy property editing (includes compact CUE4Parse-style output)
-- **Texture Injection** - Inject PNG/TGA/DDS images into Texture2D assets with BC1/BC3/BC5/BC7 compression and mipmap generation
+- **Texture Injection** - Inject PNG/TGA/DDS images into Texture2D assets (UAssetAPI object model, no binary patching). Mode A: single inline mip; Mode B: full mip chain in the cooked streaming layout (`.uptnl`/`.ubulk` + inline). Pixel format preserved from the base texture
 - **Texture Extraction** - Extract Texture2D assets to PNG/TGA/DDS/BMP with parallel batch support; handles inline (no `.ubulk`), external, and OptionalBulkData mips
 - **NiagaraSystem Editing** - Modify particle effect colors with structured ShaderLUT and ArrayColor parsing
 - **MaterialTag Injection** - Auto-inject per-slot gameplay tags from `MaterialTagAssetUserData` during mod creation
@@ -229,26 +229,28 @@ Supports PAK v11 (UE5), Oodle/Zlib/Zstd compression, encrypted and unencrypted.
 
 ### Texture Injection
 
-Inject images into existing Texture2D `.uasset` files:
+Inject images into existing Texture2D `.uasset` files. Uses UAssetAPI's object model (no binary patching) and rebuilds the platform data in the cooked layout the engine expects.
 
 ```bash
-# Inject a PNG into a texture asset
+# Inject a PNG into a texture asset (Mode B: full mip chain, default)
 UAssetTool inject_texture <base_uasset> <image_file> <output_uasset> [options]
 
 # Examples
-UAssetTool inject_texture T_Skin_D.uasset my_skin.png T_Skin_D_modded.uasset
-UAssetTool inject_texture T_Skin_D.uasset my_skin.dds output.uasset --format BC1
-UAssetTool inject_texture T_Skin_D.uasset my_skin.tga output.uasset --no-mips
+UAssetTool inject_texture T_Skin_D.uasset my_skin.png T_Skin_D_modded.uasset --usmap game.usmap
+UAssetTool inject_texture T_Skin_D.uasset my_skin.dds output.uasset --no-mips --usmap game.usmap
 ```
 
+**Two modes:**
+- **Mode B (default)** — full mip chain (down to 1×1) in the cooked **streaming** layout: high-res mips → `.uptnl` (optional), mid mips → `.ubulk` (streaming), small mips inline in `.uexp`. Produces `.uasset` + `.uexp` + `.ubulk` + `.uptnl`.
+- **Mode A (`--no-mips`)** — a single inline mip in `.uexp` only (no `.ubulk`/`.uptnl`).
+
 **Options:**
-- `--format <fmt>` - Compression format: `BC7` (default), `BC3`, `BC1`, `BC5`, `BC4`, `BGRA8`
-- `--no-mips` - Don't generate mipmaps (single mip only)
-- `--usmap <path>` - Usmap mappings for unversioned assets
+- `--no-mips` - Mode A: single inline mip (default is Mode B)
+- `--usmap <path>` - Usmap mappings (required for game-extracted unversioned textures)
 
 **Supported input formats:** PNG, TGA, DDS, BMP, JPEG
 
-The injector reads the base `.uasset` to preserve all metadata (pixel format name, texture settings), replaces the pixel data with the new image compressed to the specified format, and generates a full mipchain.
+The **pixel format is preserved from the base texture** (BC1/BC3/BC5/BC7/etc.) so the `PixelFormat` FName stays valid; the new image is encoded to that format. Output dimensions adapt to the input image. Both modes produce game-valid textures (changing the pixel format itself is not yet supported).
 
 ### Texture Extraction
 
@@ -286,10 +288,10 @@ Place your replacement images (PNG/TGA/DDS/BMP) in a folder using the **same fil
 - `T_1053_Hair_D.tga` matches `T_1053_Hair_D.uasset`
 
 ```bash
-# Example: inject all replacement textures
-UAssetTool batch_inject_texture extracted/Textures/ my_skins/ output/ --usmap game.usmap --format BC7
+# Example: inject all replacement textures (Mode B mip chain, default)
+UAssetTool batch_inject_texture extracted/Textures/ my_skins/ output/ --usmap game.usmap
 
-# Without mipmaps
+# Mode A (single inline mip, no .ubulk/.uptnl)
 UAssetTool batch_inject_texture extracted/Textures/ my_skins/ output/ --usmap game.usmap --no-mips
 ```
 

@@ -82,7 +82,6 @@ public partial class Program
                 "niagara_audit" => CliNiagaraAudit(args),
                 "skeletal_mesh_info" => CliSkeletalMeshInfo(args),
                 "inject_texture" => CliInjectTexture(args),
-                "inject_texture_obj" => CliInjectTextureObj(args),
                 "extract_texture" => CliExtractTexture(args),
                 "batch_inject_texture" => CliBatchInjectTexture(args),
                 "batch_extract_texture" => CliBatchExtractTexture(args),
@@ -133,15 +132,14 @@ public partial class Program
         Console.WriteLine("      Options: --compact                    - CUE4Parse-style compact output (read-only)");
         Console.WriteLine("    from_json <path> <output> [usmap]       - Convert JSON back to uasset (file or directory)");
         Console.WriteLine("    inject_texture <base> <image> <output>  - Inject PNG/TGA/DDS into texture uasset");
-        Console.WriteLine("      Options: --format BC7|BC3|BC1|BGRA8   - Compression format (default: BC7)");
-        Console.WriteLine("               --no-mips                    - Don't generate mipmaps");
+        Console.WriteLine("      Options: --no-mips                    - Mode A: single inline mip (default: Mode B mip chain + .ubulk/.uptnl)");
+        Console.WriteLine("               --usmap <path>               - Path to usmap (pixel format preserved from base)");
         Console.WriteLine("    extract_texture <uasset> <output>       - Extract Texture2D to PNG/TGA/DDS/BMP");
         Console.WriteLine("      Options: --format PNG|TGA|DDS|BMP     - Output format (default: PNG)");
         Console.WriteLine("               --mip <index>                - Mip level to extract (default: 0)");
         Console.WriteLine("    batch_inject_texture <uasset_dir> <image_dir> <output_dir> - Batch inject textures");
         Console.WriteLine("      Matches image files to .uasset files by filename (e.g. T_Skin_D.png -> T_Skin_D.uasset)");
-        Console.WriteLine("      Options: --format BC7|BC3|BC1|BGRA8   - Compression format (default: BC7)");
-        Console.WriteLine("               --no-mips                    - Don't generate mipmaps");
+        Console.WriteLine("      Options: --no-mips                    - Mode A: single inline mip (default: Mode B mip chain)");
         Console.WriteLine("               --usmap <path>               - Path to usmap file");
         Console.WriteLine("    batch_extract_texture <uasset_dir> <output_dir> - Batch extract textures");
         Console.WriteLine("      Extracts all Texture2D .uasset files in directory to images");
@@ -7802,31 +7800,6 @@ public partial class Program
         }
     }
     
-    private static int CliInjectTextureObj(string[] args)
-    {
-        if (args.Length < 4)
-        {
-            Console.Error.WriteLine("Usage: UAssetTool inject_texture_obj <base_uasset> <image> <output_uasset> [--no-mips] [--usmap <path>]");
-            return 1;
-        }
-        string baseUasset = args[1], imageFile = args[2], outputPath = args[3];
-        bool generateMips = true; string? usmapPath = null;
-        for (int i = 4; i < args.Length; i++)
-        {
-            if (args[i] == "--no-mips") generateMips = false;
-            else if (args[i] == "--usmap" && i + 1 < args.Length) usmapPath = args[++i];
-        }
-        Console.WriteLine($"Injecting (object model): {imageFile} -> {outputPath}");
-        var r = Texture.TextureInjector.InjectObjectModel(baseUasset, imageFile, outputPath, generateMips, usmapPath);
-        if (r.Success)
-        {
-            Console.WriteLine($"Success! {r.Width}x{r.Height}, {r.MipCount} mips, {r.PixelFormat}, {r.TotalDataSize:N0} bytes");
-            return 0;
-        }
-        Console.Error.WriteLine($"Failed: {r.ErrorMessage}");
-        return 1;
-    }
-
     private static int CliInjectTexture(string[] args)
     {
         if (args.Length < 4)
@@ -7834,30 +7807,26 @@ public partial class Program
             Console.Error.WriteLine("Usage: UAssetTool inject_texture <base_uasset> <image_file> <output_uasset> [options]");
             Console.Error.WriteLine();
             Console.Error.WriteLine("Options:");
-            Console.Error.WriteLine("  --format <fmt>  Compression format: BC7, BC3, BC1, BC5, BC4, BGRA8 (default: BC7)");
-            Console.Error.WriteLine("  --no-mips       Don't generate mipmaps");
+            Console.Error.WriteLine("  --no-mips       Mode A: single-mip, inline in .uexp (no .ubulk/.uptnl)");
+            Console.Error.WriteLine("                  (default = Mode B: full mip chain, streaming .ubulk/.uptnl + inline)");
             Console.Error.WriteLine("  --usmap <path>  Path to usmap file (required for game-extracted textures)");
             Console.Error.WriteLine();
+            Console.Error.WriteLine("  Note: the pixel format is preserved from the base texture (BC1/BC3/BC5/BC7/etc.).");
             Console.Error.WriteLine("Supported image formats: PNG, TGA, DDS, BMP, JPEG");
             return 1;
         }
-        
+
         string baseUasset = args[1];
         string imageFile = args[2];
         string outputPath = args[3];
-        
+
         // Parse options
-        var format = Texture.TextureCompressionFormat.BC7;
         bool generateMips = true;
         string? usmapPath = null;
-        
+
         for (int i = 4; i < args.Length; i++)
         {
-            if (args[i] == "--format" && i + 1 < args.Length)
-            {
-                format = Texture.TextureInjector.ParseFormat(args[++i]);
-            }
-            else if (args[i] == "--no-mips")
+            if (args[i] == "--no-mips")
             {
                 generateMips = false;
             }
@@ -7866,16 +7835,15 @@ public partial class Program
                 usmapPath = args[++i];
             }
         }
-        
-        Console.WriteLine($"Injecting texture...");
+
+        Console.WriteLine($"Injecting texture (object model)...");
         Console.WriteLine($"  Base: {baseUasset}");
         Console.WriteLine($"  Image: {imageFile}");
         Console.WriteLine($"  Output: {outputPath}");
-        Console.WriteLine($"  Format: {format}");
-        Console.WriteLine($"  Generate Mips: {generateMips}");
+        Console.WriteLine($"  Mode: {(generateMips ? "B (mip chain, streaming)" : "A (single-mip, inline)")}");
         if (usmapPath != null) Console.WriteLine($"  Usmap: {usmapPath}");
-        
-        var result = Texture.TextureInjector.Inject(baseUasset, imageFile, outputPath, format, generateMips, usmapPath);
+
+        var result = Texture.TextureInjector.InjectObjectModel(baseUasset, imageFile, outputPath, generateMips, usmapPath);
         
         if (result.Success)
         {
@@ -7991,15 +7959,12 @@ public partial class Program
         }
 
         // Parse options
-        var format = Texture.TextureCompressionFormat.BC7;
         bool generateMips = true;
         string? usmapPath = null;
 
         for (int i = 4; i < args.Length; i++)
         {
-            if (args[i] == "--format" && i + 1 < args.Length)
-                format = Texture.TextureInjector.ParseFormat(args[++i]);
-            else if (args[i] == "--no-mips")
+            if (args[i] == "--no-mips")
                 generateMips = false;
             else if (args[i] == "--usmap" && i + 1 < args.Length)
                 usmapPath = args[++i];
@@ -8029,7 +7994,7 @@ public partial class Program
 
         Console.WriteLine($"Found {imageFiles.Count} image file(s) in: {imageDir}");
         Console.WriteLine($"Found {uassetMap.Count} .uasset file(s) in: {uassetDir}");
-        Console.WriteLine($"Format: {format}, Mips: {generateMips}");
+        Console.WriteLine($"Mode: {(generateMips ? "B (mip chain, streaming)" : "A (single-mip, inline)")}");
         Console.WriteLine();
 
         Directory.CreateDirectory(outputDir);
@@ -8062,7 +8027,7 @@ public partial class Program
 
             try
             {
-                var result = Texture.TextureInjector.Inject(matchedUasset, imageFile, outputPath, format, generateMips, usmapPath);
+                var result = Texture.TextureInjector.InjectObjectModel(matchedUasset, imageFile, outputPath, generateMips, usmapPath);
                 if (result.Success)
                 {
                     Console.WriteLine($"OK ({result.Width}x{result.Height}, {result.MipCount} mips)");
