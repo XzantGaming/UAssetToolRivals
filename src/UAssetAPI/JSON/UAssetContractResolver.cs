@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using UAssetAPI.UnrealTypes;
 using UAssetAPI.ExportTypes;
 using UAssetAPI.PropertyTypes.Objects;
+using UAssetAPI.Unversioned;
 
 namespace UAssetAPI.JSON
 {
@@ -48,6 +49,8 @@ namespace UAssetAPI.JSON
             { typeof(Dictionary<string, FString>), () => new Dictionary<string, FString>() },
             { typeof(Dictionary<FString, uint>), () => new Dictionary<FString, uint>() },
             { typeof(Dictionary<FName, string>), () => new Dictionary<FName, string>() },
+            // Unversioned struct headers store their fragments in a LinkedList, not a List.
+            { typeof(LinkedList<FFragment>), () => new LinkedList<FFragment>() },
         };
 
         static UAssetContractResolver()
@@ -74,6 +77,7 @@ namespace UAssetAPI.JSON
                 (System.Collections.IDictionary)new Dictionary<string, FString>(),
                 (System.Collections.IDictionary)new Dictionary<FString, uint>(),
                 (System.Collections.IDictionary)new Dictionary<FName, string>(),
+                (System.Collections.Generic.ICollection<FFragment>)new LinkedList<FFragment>(),
             };
             GC.KeepAlive(keep);
         }
