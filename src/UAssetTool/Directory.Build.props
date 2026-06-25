@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'UAssetToolNative'">
+    <BaseIntermediateOutputPath>obj_native\</BaseIntermediateOutputPath>
+    <BaseOutputPath>bin_native\</BaseOutputPath>
+  </PropertyGroup>
+</Project>

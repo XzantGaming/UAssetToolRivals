@@ -1,6 +1,8 @@
 # Build results
 bin/
 obj/
+bin_native/
+obj_native/
 publish/
 publish-*/
 publish_selfcontained/

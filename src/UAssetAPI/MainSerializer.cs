@@ -10,6 +10,7 @@ using UAssetAPI.ExportTypes;
 using UAssetAPI.FieldTypes;
 using UAssetAPI.PropertyTypes.Objects;
 using UAssetAPI.PropertyTypes.Structs;
+using UAssetAPI.StructTypes;
 using UAssetAPI.UnrealTypes;
 using UAssetAPI.Unversioned;
 
@@ -80,44 +81,148 @@ namespace UAssetAPI
             if (_propertyTypeRegistry != null) return;
             _propertyTypeRegistry = new Dictionary<string, RegistryEntry>();
 
-            Assembly[] allDependentAssemblies = GetDependentAssemblies(registryParentDataType.Assembly).ToArray();
-            Assembly[] allAssemblies = new Assembly[allDependentAssemblies.Length + 1];
-            allAssemblies[0] = registryParentDataType.Assembly;
-            Array.Copy(allDependentAssemblies, 0, allAssemblies, 1, allDependentAssemblies.Length);
+            // Explicit, reflection-free registration of every concrete PropertyData subclass.
+            //
+            // This replaces the former runtime scan (Assembly.GetTypes() + Activator.CreateInstance
+            // + GetProperty().GetValue() + Expression.Lambda().Compile()). None of those survive
+            // NativeAOT: types/properties discovered only via reflection get their metadata trimmed
+            // (so GetProperty("PropertyType") returns null and the type is silently skipped), and
+            // Expression.Compile() is runtime codegen. The result under AOT was an EMPTY registry,
+            // which made every property read as Unknown and dropped all property data ("bad export
+            // index" once re-serialized). Listing the types explicitly both removes the reflection
+            // AND directly references each type, which roots it for AOT. Behavior is identical under
+            // the JIT (same keys, same creators, same HasCustomStructSerialization).
+            //
+            // NOTE: keep this list in sync with concrete PropertyData subclasses. Each entry probes a
+            // throwaway instance to read its (constant) PropertyType / HasCustomStructSerialization /
+            // ShouldBeRegistered via direct virtual calls — no reflection.
 
-            for (int i = 0; i < allAssemblies.Length; i++)
-            {
-                Type[] allPropertyDataTypes = allAssemblies[i].GetTypes().Where(t => t.IsSubclassOf(registryParentDataType)).ToArray();
-                for (int j = 0; j < allPropertyDataTypes.Length; j++)
-                {
-                    Type currentPropertyDataType = allPropertyDataTypes[j];
-                    if (currentPropertyDataType == null || currentPropertyDataType.ContainsGenericParameters) continue;
+            // UAssetAPI.PropertyTypes.Objects
+            RegisterPropertyType(n => new ArrayPropertyData(n));
+            RegisterPropertyType(n => new AssetObjectPropertyData(n));
+            RegisterPropertyType(n => new BoolPropertyData(n));
+            RegisterPropertyType(n => new BytePropertyData(n));
+            RegisterPropertyType(n => new DelegatePropertyData(n));
+            RegisterPropertyType(n => new DoublePropertyData(n));
+            RegisterPropertyType(n => new EnumPropertyData(n));
+            RegisterPropertyType(n => new FieldPathPropertyData(n));
+            RegisterPropertyType(n => new FloatPropertyData(n));
+            RegisterPropertyType(n => new Int16PropertyData(n));
+            RegisterPropertyType(n => new Int64PropertyData(n));
+            RegisterPropertyType(n => new Int8PropertyData(n));
+            RegisterPropertyType(n => new IntPropertyData(n));
+            RegisterPropertyType(n => new InterfacePropertyData(n));
+            RegisterPropertyType(n => new MapPropertyData(n));
+            RegisterPropertyType(n => new MulticastDelegatePropertyData(n));
+            RegisterPropertyType(n => new MulticastInlineDelegatePropertyData(n));
+            RegisterPropertyType(n => new MulticastSparseDelegatePropertyData(n));
+            RegisterPropertyType(n => new NamePropertyData(n));
+            RegisterPropertyType(n => new ObjectPropertyData(n));
+            RegisterPropertyType(n => new SetPropertyData(n));
+            RegisterPropertyType(n => new SoftObjectPropertyData(n));
+            RegisterPropertyType(n => new StrPropertyData(n));
+            RegisterPropertyType(n => new TextPropertyData(n));
+            RegisterPropertyType(n => new UInt16PropertyData(n));
+            RegisterPropertyType(n => new UInt32PropertyData(n));
+            RegisterPropertyType(n => new UInt64PropertyData(n));
+            RegisterPropertyType(n => new UnknownPropertyData(n));
+            RegisterPropertyType(n => new WeakObjectPropertyData(n));
 
-                    var testInstance = Activator.CreateInstance(currentPropertyDataType);
+            // UAssetAPI.PropertyTypes.Structs
+            RegisterPropertyType(n => new Box2DPropertyData(n));
+            RegisterPropertyType(n => new Box2fPropertyData(n));
+            RegisterPropertyType(n => new BoxPropertyData(n));
+            RegisterPropertyType(n => new ClothLODDataCommonPropertyData(n));
+            RegisterPropertyType(n => new ClothLODDataPropertyData(n));
+            RegisterPropertyType(n => new ClothTetherDataPropertyData(n));
+            RegisterPropertyType(n => new ColorMaterialInputPropertyData(n));
+            RegisterPropertyType(n => new ColorPropertyData(n));
+            RegisterPropertyType(n => new DateTimePropertyData(n));
+            RegisterPropertyType(n => new DeprecateSlateVector2DPropertyData(n));
+            RegisterPropertyType(n => new ExpressionInputPropertyData(n));
+            RegisterPropertyType(n => new FloatRangePropertyData(n));
+            RegisterPropertyType(n => new FontCharacterPropertyData(n));
+            RegisterPropertyType(n => new FontDataPropertyData(n));
+            RegisterPropertyType(n => new FrameNumberPropertyData(n));
+            RegisterPropertyType(n => new GameplayTagContainerPropertyData(n));
+            RegisterPropertyType(n => new GuidPropertyData(n));
+            RegisterPropertyType(n => new IntPointPropertyData(n));
+            RegisterPropertyType(n => new IntVector2PropertyData(n));
+            RegisterPropertyType(n => new IntVectorPropertyData(n));
+            RegisterPropertyType(n => new KeyHandleMapPropertyData(n));
+            RegisterPropertyType(n => new LevelSequenceObjectReferenceMapPropertyData(n));
+            RegisterPropertyType(n => new LinearColorPropertyData(n));
+            RegisterPropertyType(n => new MaterialAttributesInputPropertyData(n));
+            RegisterPropertyType(n => new MaterialOverrideNanitePropertyData(n));
+            RegisterPropertyType(n => new MatrixPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneDoubleChannelPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneEvalTemplatePtrPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneEvaluationFieldEntityTreePropertyData(n));
+            RegisterPropertyType(n => new MovieSceneEvaluationKeyPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneEventParametersPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneFloatChannelPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneFloatValuePropertyData(n));
+            RegisterPropertyType(n => new MovieSceneFrameRangePropertyData(n));
+            RegisterPropertyType(n => new MovieSceneGenerationLedgerPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneSegmentIdentifierPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneSegmentPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneSequenceIDPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneSequenceInstanceDataPtrPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneSubSectionFieldDataPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneSubSequenceTreePropertyData(n));
+            RegisterPropertyType(n => new MovieSceneTrackFieldDataPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneTrackIdentifierPropertyData(n));
+            RegisterPropertyType(n => new MovieSceneTrackImplementationPtrPropertyData(n));
+            RegisterPropertyType(n => new NameCurveKeyPropertyData(n));
+            RegisterPropertyType(n => new NavAgentSelectorPropertyData(n));
+            RegisterPropertyType(n => new NiagaraDataInterfaceGPUParamInfoPropertyData(n));
+            RegisterPropertyType(n => new NiagaraVariableBasePropertyData(n));
+            RegisterPropertyType(n => new NiagaraVariablePropertyData(n));
+            RegisterPropertyType(n => new NiagaraVariableWithOffsetPropertyData(n));
+            RegisterPropertyType(n => new PerPlatformBoolPropertyData(n));
+            RegisterPropertyType(n => new PerPlatformFloatPropertyData(n));
+            RegisterPropertyType(n => new PerPlatformFrameRatePropertyData(n));
+            RegisterPropertyType(n => new PerPlatformIntPropertyData(n));
+            RegisterPropertyType(n => new PerQualityLevelFloatPropertyData(n));
+            RegisterPropertyType(n => new PerQualityLevelIntPropertyData(n));
+            RegisterPropertyType(n => new PlanePropertyData(n));
+            RegisterPropertyType(n => new QuatPropertyData(n));
+            RegisterPropertyType(n => new RawStructPropertyData(n));
+            RegisterPropertyType(n => new RichCurveKeyPropertyData(n));
+            RegisterPropertyType(n => new RotatorPropertyData(n));
+            RegisterPropertyType(n => new ScalarMaterialInputPropertyData(n));
+            RegisterPropertyType(n => new SectionEvaluationDataTreePropertyData(n));
+            RegisterPropertyType(n => new SkeletalMeshAreaWeightedTriangleSamplerPropertyData(n));
+            RegisterPropertyType(n => new SkeletalMeshSamplingLODBuiltDataPropertyData(n));
+            RegisterPropertyType(n => new SmartNamePropertyData(n));
+            RegisterPropertyType(n => new SoftAssetPathPropertyData(n));
+            RegisterPropertyType(n => new SoftClassPathPropertyData(n));
+            RegisterPropertyType(n => new SoftObjectPathPropertyData(n));
+            RegisterPropertyType(n => new StringAssetReferencePropertyData(n));
+            RegisterPropertyType(n => new StringClassReferencePropertyData(n));
+            RegisterPropertyType(n => new StringCurveKeyPropertyData(n));
+            RegisterPropertyType(n => new StructPropertyData(n)); // owns "StructProperty" (MovieSceneTemplatePropertyData inherits the same key but is never registered)
+            RegisterPropertyType(n => new TimespanPropertyData(n));
+            RegisterPropertyType(n => new TwoVectorsPropertyData(n));
+            RegisterPropertyType(n => new Vector2DPropertyData(n));
+            RegisterPropertyType(n => new Vector2MaterialInputPropertyData(n));
+            RegisterPropertyType(n => new Vector3fPropertyData(n));
+            RegisterPropertyType(n => new Vector4PropertyData(n));
+            RegisterPropertyType(n => new Vector4fPropertyData(n));
+            RegisterPropertyType(n => new VectorMaterialInputPropertyData(n));
+            RegisterPropertyType(n => new VectorNetQuantize100PropertyData(n));
+            RegisterPropertyType(n => new VectorNetQuantize10PropertyData(n));
+            RegisterPropertyType(n => new VectorNetQuantizeNormalPropertyData(n));
+            RegisterPropertyType(n => new VectorNetQuantizePropertyData(n));
+            RegisterPropertyType(n => new VectorPropertyData(n));
+            RegisterPropertyType(n => new ViewTargetBlendParamsPropertyData(n));
+            RegisterPropertyType(n => new WeightedRandomSamplerPropertyData(n));
 
-                    FString returnedPropType = currentPropertyDataType.GetProperty("PropertyType")?.GetValue(testInstance, null) as FString;
-                    if (returnedPropType == null) continue;
-                    bool? returnedHasCustomStructSerialization = currentPropertyDataType.GetProperty("HasCustomStructSerialization")?.GetValue(testInstance, null) as bool?;
-                    if (returnedHasCustomStructSerialization == null) continue;
-                    bool? returnedShouldBeRegistered = currentPropertyDataType.GetProperty("ShouldBeRegistered")?.GetValue(testInstance, null) as bool?;
-                    if (returnedShouldBeRegistered == null) continue;
+            // UAssetAPI.StructTypes
+            RegisterPropertyType(n => new SkeletalMeshSamplingRegionBuiltDataPropertyData(n));
 
-                    if ((bool)returnedShouldBeRegistered)
-                    {
-                        RegistryEntry res = new RegistryEntry();
-                        res.PropertyType = currentPropertyDataType;
-                        res.HasCustomStructSerialization = (bool)returnedHasCustomStructSerialization;
-
-                        var nameParam = Expression.Parameter(typeof(FName));
-                        res.Creator = Expression.Lambda<Func<FName, PropertyData>>(
-                           Expression.New(currentPropertyDataType.GetConstructor(new[] { typeof(FName), }), new[] { nameParam, }),
-                           nameParam
-                        ).Compile();
-
-                        _propertyTypeRegistry[returnedPropType.Value] = res;
-                    }
-                }
-            }
+            // UAssetAPI.UnrealTypes
+            RegisterPropertyType(n => new UniqueNetIdReplPropertyData(n));
 
             // Fetch the current git commit while we're here
             UAPUtils.CurrentCommit = string.Empty;
@@ -131,6 +236,25 @@ namespace UAssetAPI
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Registers a single concrete PropertyData type in the property registry without any
+        /// reflection (NativeAOT-safe). Probes a throwaway instance to read the type's constant
+        /// PropertyType / HasCustomStructSerialization / ShouldBeRegistered via direct virtual calls.
+        /// </summary>
+        private static void RegisterPropertyType(Func<FName, PropertyData> creator)
+        {
+            PropertyData probe = creator(null);
+            if (!probe.ShouldBeRegistered) return;
+            string key = probe.PropertyType?.Value;
+            if (string.IsNullOrEmpty(key)) return;
+            _propertyTypeRegistry[key] = new RegistryEntry
+            {
+                PropertyType = probe.GetType(),
+                HasCustomStructSerialization = probe.HasCustomStructSerialization,
+                Creator = creator
+            };
         }
 
         /// <summary>

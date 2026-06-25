@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<linker>
+  <assembly fullname="UAssetAPI" preserve="all" required="true" />
+  <assembly fullname="Newtonsoft.Json" preserve="all" required="true" />
+  <!-- Root the generic collection ctors so Newtonsoft can construct them by reflection
+       (including the temporary List<T> it builds for arrays / read-only collections). -->
+  <assembly fullname="System.Private.CoreLib">
+    <type fullname="System.Collections.Generic.List`1" preserve="all" />
+    <type fullname="System.Collections.Generic.Dictionary`2" preserve="all" />
+  </assembly>
+</linker>
