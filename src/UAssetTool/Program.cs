@@ -1493,6 +1493,9 @@ public partial class Program
             Console.Error.WriteLine("  --container <path>       Additional container to load for cross-package imports");
             Console.Error.WriteLine("  --aes <hex>              AES key for decryption (can specify multiple times)");
             Console.Error.WriteLine("  --filter <patterns...>   Only extract packages matching patterns (space-separated)");
+            Console.Error.WriteLine("                           Matches VFS paths as CUE4Parse spells them");
+            Console.Error.WriteLine("                           (Marvel/Content/..., Marvel/Plugins/<Plugin>/Content/...,");
+            Console.Error.WriteLine("                           Engine/Content/...) and mount paths (/Game/..., /Engine/...)");
             Console.Error.WriteLine("                           Can also pass a .txt file containing one pattern per line");
             Console.Error.WriteLine("  --with-deps              Also extract imported/referenced packages");
             Console.Error.WriteLine("  --mod <path>             Path to modded .utoc file or directory containing .utoc files.");
@@ -1503,6 +1506,8 @@ public partial class Program
             Console.Error.WriteLine("Examples:");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter SK_1014 SK_1057 SK_1036");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter Characters/1014 Characters/1057");
+            Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter Marvel/Plugins/MarvelGAS/Content/Marvel/AbilitySystem/1053");
+            Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter Engine/Plugins/FX/Niagara/Content");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --mod \"C:/Mods/my_mod.utoc\" --filter SK_1014");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --mod \"C:/Mods/\" --with-deps");
             Console.Error.WriteLine("  extract_iostore_legacy \"C:/Game/Paks\" output --filter filters.txt");
@@ -1722,56 +1727,60 @@ public partial class Program
             }
             else if (filterPatterns.Count > 0)
             {
-                packageIds = new List<ulong>();
-                
+                // Exact paths resolve by lookup; substrings share one pass over the list.
+                var selected = new HashSet<ulong>();
+                var scanPatterns = new List<string>();
+
                 foreach (var filterPattern in filterPatterns)
                 {
-                    // Check if filter looks like an exact package path (starts with /Game/)
-                    if (filterPattern.StartsWith("/Game/"))
+                    if (filterPattern.StartsWith("/"))
                     {
-                        // Direct lookup by package path - much faster than iterating all packages
                         ulong packageId = ZenPackage.FPackageId.FromName(filterPattern);
                         if (context.HasPackage(packageId))
                         {
-                            if (!packageIds.Contains(packageId))
-                                packageIds.Add(packageId);
+                            selected.Add(packageId);
                             Console.WriteLine($"Direct lookup: found package {filterPattern}");
-                        }
-                        else
-                        {
-                            // Try partial match as fallback
-                            var found = context.FindPackageIdByPath(filterPattern);
-                            if (found.HasValue && !packageIds.Contains(found.Value))
-                            {
-                                packageIds.Add(found.Value);
-                                Console.WriteLine($"Found package by partial match: {context.GetPackagePath(found.Value)}");
-                            }
-                            else if (!found.HasValue)
-                            {
-                                Console.Error.WriteLine($"Warning: Package not found: {filterPattern}");
-                            }
+                            continue;
                         }
                     }
                     else
                     {
-                        // Partial filter - search through all packages (slower)
-                        int matchCount = 0;
-                        foreach (var pkgId in context.GetAllPackageIds())
+                        var byVfs = context.FindPackageIdByVfsPath(filterPattern);
+                        if (byVfs.HasValue)
                         {
-                            string? path = context.GetPackagePath(pkgId);
-                            if (!string.IsNullOrEmpty(path) && path.Contains(filterPattern, StringComparison.OrdinalIgnoreCase))
-                            {
-                                if (!packageIds.Contains(pkgId))
-                                {
-                                    packageIds.Add(pkgId);
-                                    matchCount++;
-                                }
-                            }
+                            selected.Add(byVfs.Value);
+                            Console.WriteLine($"Direct lookup: found package {context.GetContainerPath(byVfs.Value)}");
+                            continue;
                         }
-                        Console.WriteLine($"Filter '{filterPattern}' matched {matchCount} packages");
+                    }
+
+                    scanPatterns.Add(filterPattern);
+                }
+
+                if (scanPatterns.Count > 0)
+                {
+                    var matchCounts = new int[scanPatterns.Count];
+                    foreach (var pkgId in context.GetAllPackageIds())
+                    {
+                        for (int p = 0; p < scanPatterns.Count; p++)
+                        {
+                            if (!context.PathMatchesFilter(pkgId, scanPatterns[p]))
+                                continue;
+                            matchCounts[p]++;
+                            selected.Add(pkgId);
+                        }
+                    }
+
+                    for (int p = 0; p < scanPatterns.Count; p++)
+                    {
+                        if (matchCounts[p] == 0)
+                            Console.Error.WriteLine($"Warning: Filter '{scanPatterns[p]}' matched no packages");
+                        else
+                            Console.WriteLine($"Filter '{scanPatterns[p]}' matched {matchCounts[p]} packages");
                     }
                 }
-                
+
+                packageIds = selected.ToList();
                 skipFilterCheck = true; // Already filtered
                 Console.WriteLine($"Total packages matching filters [{string.Join(", ", filterPatterns)}]: {packageIds.Count}");
             }
@@ -1785,31 +1794,6 @@ public partial class Program
 
             bool debugMode = Environment.GetEnvironmentVariable("DEBUG") == "1";
 
-            // Helper: resolve output path from package name
-            static string ResolveOutputPath(string packageName)
-            {
-                string relPath = packageName;
-                if (relPath.Contains("/../"))
-                {
-                    string tempRoot = Path.GetTempPath();
-                    string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
-                    string resolved = Path.GetFullPath(tempPath);
-                    relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
-                    if (!relPath.StartsWith("/")) relPath = "/" + relPath;
-                    int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-                    if (contentIdx >= 0)
-                        relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
-                }
-                if (relPath.StartsWith("/Game/"))
-                    relPath = "Marvel/Content/" + relPath.Substring(6);
-                else if (relPath.StartsWith("/"))
-                    relPath = relPath.Substring(1);
-                relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
-                if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
-                    relPath += ".uasset";
-                return relPath;
-            }
-
             // Helper function to extract a single package (thread-safe)
             List<ulong> ExtractPackage(ulong packageId, bool isDependency)
             {
@@ -1822,9 +1806,7 @@ public partial class Program
 
                 if (!isDependency && !skipFilterCheck && filterPatterns.Count > 0)
                 {
-                    bool matchesAnyFilter = filterPatterns.Any(filter =>
-                        !string.IsNullOrEmpty(fullPath) && fullPath.Contains(filter, StringComparison.OrdinalIgnoreCase));
-                    if (!matchesAnyFilter)
+                    if (!filterPatterns.Any(filter => context.PathMatchesFilter(packageId, filter)))
                         return imports;
                 }
 
@@ -1861,16 +1843,7 @@ public partial class Program
                         imports.AddRange(converter.GetImportedPackageIds());
                     }
 
-                    // Prefer the path the package actually occupies in the container. Deriving
-                    // a location from the package name instead cannot place anything outside
-                    // Marvel/Content: it has no way to know that /MarvelGAS/ lives under
-                    // Marvel/Plugins/MarvelGAS/Content, or /Niagara/ under
-                    // Engine/Plugins/FX/Niagara/Content, so those collapsed into the main
-                    // content tree and 67 plugin packages landed on top of real ones.
-                    string? containerPath = context.GetContainerPath(packageId);
-                    string relPath = !string.IsNullOrEmpty(containerPath)
-                        ? containerPath.Replace('/', Path.DirectorySeparatorChar)
-                        : ResolveOutputPath(packageName);
+                    string relPath = ResolveVfsOutputPath(context, packageId, packageName);
                     string outputAssetPath = Path.Combine(outputDir, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
@@ -6643,13 +6616,58 @@ public partial class Program
     ///   /Game/X                    → Marvel/Content/X
     ///   Marvel/Content/X           → Marvel/Content/X (no change)
     /// </summary>
+    /// <summary>
+    /// VFS output path for a package, the way CUE4Parse spells it.
+    /// </summary>
+    private static string ResolveVfsOutputPath(ZenPackage.FZenPackageContext context, ulong packageId, string packageName)
+    {
+        // A cooked VFS path always has a /Content/ segment; a mod container may index by mount.
+        string? containerPath = context.GetContainerPath(packageId);
+        string relPath;
+
+        if (!string.IsNullOrEmpty(containerPath) && containerPath.Contains("/Content/", StringComparison.OrdinalIgnoreCase))
+        {
+            relPath = containerPath;
+        }
+        else
+        {
+            relPath = packageName;
+
+            if (relPath.Contains("/../"))
+            {
+                string tempRoot = Path.GetTempPath();
+                string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                string resolved = Path.GetFullPath(tempPath);
+                relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
+                if (!relPath.StartsWith("/")) relPath = "/" + relPath;
+                int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+                if (contentIdx >= 0)
+                    relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
+            }
+
+            string? mounted = context.ResolveMountToVfsPath(relPath);
+            if (!string.IsNullOrEmpty(mounted))
+                relPath = mounted;
+            else if (relPath.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase))
+                relPath = "Engine/Content/" + relPath.Substring(8);
+            else if (!string.IsNullOrEmpty(containerPath))
+                relPath = containerPath;
+            else
+                relPath = ResolveGamePathToContent(relPath);
+        }
+
+        relPath = relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
+        if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
+            !relPath.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+            relPath += ".uasset";
+        return relPath;
+    }
+
     private static string ResolveGamePathToContent(string path)
     {
-        // Strip leading ../../../ (mount point prefix)
-        string p = path;
-        while (p.StartsWith("../"))
-            p = p.Substring(3);
-        
+        // Handles a mount prefix that the directory index repeated, not just a leading one.
+        string p = VfsPath.StripMountPrefix(path);
+
         // Convert /Game/X → Marvel/Content/X
         if (p.StartsWith("/Game/"))
             p = "Marvel/Content" + p.Substring(5);
@@ -6846,31 +6864,8 @@ public partial class Program
                     // Convert to legacy format using ZenToLegacyConverter
                     var converter = new ZenPackage.ZenToLegacyConverter(context, packageId);
                     var legacyBundle = converter.Convert();
-                    
-                    // Normalize path for output
-                    string relPath = packageName;
-                    
-                    // Resolve /../ patterns
-                    if (relPath.Contains("/../"))
-                    {
-                        string tempRoot = Path.GetTempPath();
-                        string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
-                        string resolved = Path.GetFullPath(tempPath);
-                        relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
-                        if (!relPath.StartsWith("/"))
-                            relPath = "/" + relPath;
-                        int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-                        if (contentIdx >= 0)
-                            relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
-                    }
-                    
-                    // Resolve /Game/ to Marvel/Content/ for on-disk folder structure
-                    relPath = ResolveGamePathToContent(relPath);
-                    
-                    relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
-                    if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
-                        relPath += ".uasset";
-                    
+
+                    string relPath = ResolveVfsOutputPath(context, packageId, packageName);
                     string outputAssetPath = Path.Combine(outputDir, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
@@ -7032,18 +7027,9 @@ public partial class Program
             // Apply filter patterns if specified
             if (filterPatterns != null && filterPatterns.Count > 0)
             {
-                var filtered = new List<ulong>();
-                foreach (var packageId in packagesToExtract)
-                {
-                    string? path = context.GetPackagePath(packageId);
-                    if (string.IsNullOrEmpty(path)) continue;
-
-                    // Check if path matches any filter pattern
-                    bool matches = filterPatterns.Any(pattern =>
-                        path.Contains(pattern, StringComparison.OrdinalIgnoreCase));
-
-                    if (matches) filtered.Add(packageId);
-                }
+                var filtered = packagesToExtract
+                    .Where(id => filterPatterns.Any(pattern => context.PathMatchesFilter(id, pattern)))
+                    .ToList();
                 packagesToExtract = filtered;
                 Console.Error.WriteLine($"[ExtractIoStoreLegacy] Filtered to {packagesToExtract.Count()} packages matching patterns");
             }
@@ -7081,26 +7067,7 @@ public partial class Program
                     if (withDeps)
                         imports.AddRange(converter.GetImportedPackageIds());
 
-                    // Resolve path and write files (same logic as ExtractIoStoreJson)
-                    string relPath = packageName;
-                    if (relPath.Contains("/../"))
-                    {
-                        string tempRoot = Path.GetTempPath();
-                        string tempPath = Path.Combine(tempRoot, relPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
-                        string resolved = Path.GetFullPath(tempPath);
-                        relPath = resolved.Substring(tempRoot.Length).Replace(Path.DirectorySeparatorChar, '/');
-                        if (!relPath.StartsWith("/"))
-                            relPath = "/" + relPath;
-                        int contentIdx = relPath.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-                        if (contentIdx >= 0)
-                            relPath = "/Game" + relPath.Substring(contentIdx + "/Content".Length);
-                    }
-
-                    relPath = ResolveGamePathToContent(relPath);
-                    relPath = relPath.Replace('/', Path.DirectorySeparatorChar);
-                    if (!relPath.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
-                        relPath += ".uasset";
-
+                    string relPath = ResolveVfsOutputPath(context, packageId, packageName);
                     string outputAssetPath = Path.Combine(outputPath, relPath);
                     string? outputAssetDir = Path.GetDirectoryName(outputAssetPath);
                     if (!string.IsNullOrEmpty(outputAssetDir))
